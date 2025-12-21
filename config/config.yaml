@@ -1,0 +1,32 @@
+samples:
+  population_name: "Spoonbill"
+  
+resources:
+  vcf: "resources/merged.vcf"
+  genome: "resources/genome.fasta"
+  genes: "resources/genes.gff"
+  # Ссылки на эталонные половые хромосомы
+  ref_Z_url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/003/957/565/GCF_003957565.2_bTaeGut1.4.pri/GCF_003957565.2_bTaeGut1.4.pri_assembly_structure/Primary_Assembly/assembled_chromosomes/FASTA/chrZ.fna.gz"
+  ref_W_url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/002/315/GCF_000002315.6_GRCg6a/GCF_000002315.6_GRCg6a_assembly_structure/Primary_Assembly/assembled_chromosomes/FASTA/chrW.fna.gz"
+  # Опционально: файл с оценками консервативности (если есть, иначе SnpEff стандартный)
+  gerp_scores: "" 
+
+filtering:
+  qual: 30
+  min_depth: 107
+  max_depth: 640
+  max_missing: 0.9
+
+pruning:
+  window_size: 50
+  step_size: 10
+  r2_threshold: 0.2
+
+snmf:
+  K_min: 1
+  K_max: 5
+  repetitions: 5
+
+dadi:
+  projections: [40]  # На сколько гаплотипов проецировать
+  bootstraps: 50     # Количество бутстрэпов

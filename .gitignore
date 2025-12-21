@@ -1,0 +1,27 @@
+# Игнорируем тяжелые данные
+resources/
+results/qc/
+results/load/*.vcf
+results/snpeff_data/
+results/demography/
+*.gz
+*.csi
+*.log
+.snakemake/
+
+# Но сохраняем папку с графиками и результатами моделей
+!results/
+!results/plots/
+!results/plots/*.png
+!results/dadi/
+!results/dadi/*.png
+!results/models/
+!results/models/*.png
+
+# Игнорируем временные файлы PLINK
+*.bed
+*.bim
+*.fam
+*.map
+*.ped
+*.nose*
