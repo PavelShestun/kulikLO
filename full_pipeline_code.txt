@@ -1,0 +1,1178 @@
+Snakefile:
+configfile: "config/config.yaml"
+
+rule all:
+    input:
+        "results/qc/stats_final.txt",
+        "results/plots/PCA_plot.png",
+        "results/plots/sNMF_entropy.png",
+        "results/dadi/best_model_plot.png",
+        "results/load/Mutational_Load_plot_final.png",
+        "results/models/slim_dynamic_result.png",
+        "results/plots/ROH_Inbreeding.png",
+        "results/plots/Genomic_Windows.png"
+
+# --- 1. Определение пола ---
+rule download_sex_refs:
+    output: z="resources/ref_sex/chrZ.fna", w="resources/ref_sex/chrW.fna"
+    params: z_url=config["resources"]["ref_Z_url"], w_url=config["resources"]["ref_W_url"]
+    shell: "wget -O {output.z}.gz {params.z_url} && gunzip {output.z}.gz; wget -O {output.w}.gz {params.w_url} && gunzip {output.w}.gz"
+
+rule blast_db:
+    input: config["resources"]["genome"]
+    output: multiext("resources/blast_db/calidris", ".ndb", ".nhr", ".nsq")
+    shell: "makeblastdb -in {input} -dbtype nucl -out resources/blast_db/calidris"
+
+rule blast_search:
+    input: z="resources/ref_sex/chrZ.fna", w="resources/ref_sex/chrW.fna", db=multiext("resources/blast_db/calidris", ".ndb", ".nhr", ".nsq")
+    output: z_res="results/sex_check/blast_Z.txt", w_res="results/sex_check/blast_W.txt"
+    threads: 8
+    shell: "blastn -query {input.z} -db resources/blast_db/calidris -out {output.z_res} -outfmt 6 -evalue 1e-10 -num_threads {threads}; blastn -query {input.w} -db resources/blast_db/calidris -out {output.w_res} -outfmt 6 -evalue 1e-10 -num_threads {threads}"
+
+rule identify_sex_scaffolds:
+    input: z="results/sex_check/blast_Z.txt", w="results/sex_check/blast_W.txt"
+    output: "results/sex_check/sex_scaffolds.txt"
+    shell: "python scripts/detect_sex_scaffolds.py {input.z} {input.w} {output}"
+
+# --- 2. Фильтрация ---
+rule filter_vcf_full:
+    input: vcf=config["resources"]["vcf"], sex="results/sex_check/sex_scaffolds.txt"
+    output: "results/qc/clean_full.vcf.gz"
+    shell: "bcftools view {input.vcf} -O z -o {output} && bcftools index {output}"
+
+rule qc_stats:
+    input: "results/qc/clean_full.vcf.gz"
+    output: "results/qc/stats_final.txt"
+    shell: "bcftools stats {input} > {output}"
+
+# --- 3. PCA (Исправлено рисование) ---
+rule prune_data:
+    input: "results/qc/clean_full.vcf.gz"
+    output: pruned_vcf="results/qc/pruned.vcf", vec="results/qc/pca.eigenvec", val="results/qc/pca.eigenval"
+    shell:
+        """
+        bcftools annotate --set-id '%CHROM:%POS' {input} -O z -o results/qc/annotated.vcf.gz
+        vcftools --gzvcf results/qc/annotated.vcf.gz --plink --out results/qc/temp_plink
+        sed -i 's/^0/1/' results/qc/temp_plink.map
+        plink --file results/qc/temp_plink --allow-extra-chr --indep-pairwise 50 10 0.2 --out results/qc/pruning
+        plink --file results/qc/temp_plink --allow-extra-chr --extract results/qc/pruning.prune.in --make-bed --out results/qc/for_pca
+        plink --bfile results/qc/for_pca --recode vcf --out results/qc/pruned
+        plink --bfile results/qc/for_pca --allow-extra-chr --pca --out results/qc/pca
+        mv results/qc/pca.eigenvec {output.vec}
+        mv results/qc/pca.eigenval {output.val}
+        rm results/qc/annotated.vcf.gz results/qc/temp_plink*
+        """
+
+rule run_pca_plot:
+    input: vec="results/qc/pca.eigenvec", val="results/qc/pca.eigenval"
+    output: "results/plots/PCA_plot.png"
+    shell:
+        """
+        python -c "
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+pca = pd.read_csv('{input.vec}', sep='\s+', header=None)
+pca[1] = pca[1].apply(lambda x: os.path.basename(x).split('.')[0])
+plt.figure(figsize=(10,8))
+plt.scatter(pca[2], pca[3], s=150, color='blue', alpha=0.6, edgecolor='k')
+for i, txt in enumerate(pca[1]):
+    plt.annotate(txt, (pca.iloc[i, 2], pca.iloc[i, 3]), fontsize=8)
+plt.xlabel('PC1'); plt.ylabel('PC2'); plt.title('PCA Analysis')
+plt.grid(True, alpha=0.2)
+plt.savefig('{output}')"
+        """
+
+# --- 4-8. Остальные анализы ---
+rule run_snmf:
+    input: "results/qc/pruned.vcf"
+    output: plot="results/plots/sNMF_entropy.png"
+    params: k_min=config["snmf"]["K_min"], k_max=config["snmf"]["K_max"], reps=config["snmf"]["repetitions"]
+    shell: "Rscript scripts/run_snmf.R {input} {params.k_min} {params.k_max} {params.reps} {output.plot} || touch {output.plot}"
+
+rule dadi_inference:
+    input: "results/qc/pruned.vcf"
+    output: params="results/dadi/best_params.txt", plot="results/dadi/best_model_plot.png"
+    shell:
+        """
+        bcftools query -l {input} > results/dadi/pop.txt
+        awk '{{print $1 "\\tSpoonbill"}}' results/dadi/pop.txt > results/dadi/pop_map.txt
+        python scripts/dadi_inference.py {input} results/dadi/pop_map.txt {output.params} {output.plot}
+        """
+
+rule snpeff_db:
+    input: g=config["resources"]["genome"], a=config["resources"]["genes"]
+    output: directory("results/snpeff_data/calidris_pygmaea")
+    shell: "mkdir -p results/snpeff_data/calidris_pygmaea; cp {input.g} results/snpeff_data/calidris_pygmaea/sequences.fa; cp {input.a} results/snpeff_data/calidris_pygmaea/genes.gff; echo 'data.dir = ./results/snpeff_data/' > snpEff_local.config; echo 'calidris_pygmaea.genome : Calidris pygmaea' >> snpEff_local.config; snpEff build -c snpEff_local.config -gff3 -v -noCheckCds -noCheckProtein calidris_pygmaea"
+
+rule annotate_load:
+    input: vcf="results/qc/clean_full.vcf.gz", db="results/snpeff_data/calidris_pygmaea"
+    output: "results/load/annotated.vcf"
+    shell: "snpEff ann -c snpEff_local.config -v calidris_pygmaea {input.vcf} > {output}"
+
+rule plot_load:
+    input: "results/load/annotated.vcf"
+    output: "results/load/Mutational_Load_plot_final.png"
+    shell: "python scripts/count_and_plot_load.py {input} {output}"
+
+rule slim_dynamic:
+    input: "results/dadi/best_params.txt"
+    output: "results/models/slim_dynamic_result.png"
+    shell: "python scripts/run_slim_dynamic.py {input} {output}"
+
+rule calc_roh:
+    input: "results/qc/clean_full.vcf.gz"
+    output: hom="results/qc/plink.hom", plot="results/plots/ROH_Inbreeding.png"
+    shell:
+        """
+        bcftools annotate --set-id '%CHROM:%POS' {input} -O z -o results/qc/ann_roh.vcf.gz
+        vcftools --gzvcf results/qc/ann_roh.vcf.gz --plink --out results/qc/temp_roh
+        sed -i 's/^0/1/' results/qc/temp_roh.map
+        plink --file results/qc/temp_roh --allow-extra-chr --homozyg --homozyg-kb 100 --homozyg-snp 50 --out results/qc/plink_roh
+        python scripts/plot_roh.py results/qc/plink_roh.hom {output.plot}
+        cp results/qc/plink_roh.hom {output.hom}
+        rm results/qc/ann_roh.vcf.gz results/qc/temp_roh*
+        """
+
+rule genomic_windows:
+    input: "results/qc/clean_full.vcf.gz"
+    output: pi="results/qc/diversity.windowed.pi", tajima="results/qc/diversity.Tajima.D", plot="results/plots/Genomic_Windows.png"
+    shell: "vcftools --gzvcf {input} --window-pi 50000 --out results/qc/diversity; vcftools --gzvcf {input} --TajimaD 50000 --out results/qc/diversity; python scripts/plot_windows.py {output.pi} {output.tajima} {output.plot}"
+
+
+==================================================
+
+config/config.yaml:
+samples:
+  population_name: "Spoonbill"
+  
+resources:
+  vcf: "resources/merged.vcf"
+  genome: "resources/genome.fasta"
+  genes: "resources/genes.gff"
+  # Ссылки на эталонные половые хромосомы
+  ref_Z_url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/003/957/565/GCF_003957565.2_bTaeGut1.4.pri/GCF_003957565.2_bTaeGut1.4.pri_assembly_structure/Primary_Assembly/assembled_chromosomes/FASTA/chrZ.fna.gz"
+  ref_W_url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/002/315/GCF_000002315.6_GRCg6a/GCF_000002315.6_GRCg6a_assembly_structure/Primary_Assembly/assembled_chromosomes/FASTA/chrW.fna.gz"
+  # Опционально: файл с оценками консервативности (если есть, иначе SnpEff стандартный)
+  gerp_scores: "" 
+
+filtering:
+  qual: 30
+  min_depth: 107
+  max_depth: 640
+  max_missing: 0.9
+
+pruning:
+  window_size: 50
+  step_size: 10
+  r2_threshold: 0.2
+
+snmf:
+  K_min: 1
+  K_max: 5
+  repetitions: 5
+
+dadi:
+  projections: [40]  # На сколько гаплотипов проецировать
+  bootstraps: 50     # Количество бутстрэпов
+
+
+==================================================
+
+environment.yaml:
+name: genomics_full
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - _libgcc_mutex=0.1=conda_forge
+  - _openmp_mutex=4.5=2_gnu
+  - _r-mutex=1.0.1=anacondar_1
+  - admixture=1.3.0=0
+  - aioeasywebdav=2.4.0=py39hf3d152e_1001
+  - aiohappyeyeballs=2.6.1=pyhd8ed1ab_0
+  - aiohttp=3.12.15=py39heb7d2ae_0
+  - aiosignal=1.4.0=pyhd8ed1ab_0
+  - alsa-lib=1.2.11=hd590300_1
+  - amply=0.1.6=pyhd8ed1ab_1
+  - annotated-types=0.7.0=pyhd8ed1ab_1
+  - appdirs=1.4.4=pyhd8ed1ab_1
+  - async-timeout=5.0.1=pyhd8ed1ab_1
+  - attr=2.5.2=h39aace5_0
+  - attrs=25.3.0=pyh71513ae_0
+  - bcftools=1.19=h8b25389_1
+  - bcrypt=4.3.0=py39h20260ba_1
+  - beagle=5.5_27Feb25.75f=hdfd78af_0
+  - bedtools=2.31.1=hf5e1c6e_2
+  - binutils_impl_linux-64=2.45=bootstrap_h59bd682_4
+  - bioconductor-lea=3.18.0=r44h3df3fcb_0
+  - biopython=1.85=py39h8cd3c5a_1
+  - blast=2.16.0=hc155240_3
+  - boto3=1.40.13=pyhd8ed1ab_0
+  - botocore=1.40.13=pyge39_1234567_0
+  - brotli=1.2.0=hed03a55_1
+  - brotli-bin=1.2.0=hb03c661_1
+  - brotli-python=1.0.9=py39h5a03fae_8
+  - bwidget=1.10.1=ha770c72_1
+  - bzip2=1.0.8=hda65f42_8
+  - c-ares=1.34.6=hb03c661_0
+  - ca-certificates=2025.11.12=hbd8a1cb_0
+  - cachetools=5.5.2=pyhd8ed1ab_0
+  - cairo=1.18.0=h3faef2a_0
+  - certifi=2025.8.3=pyhd8ed1ab_0
+  - cffi=1.17.1=py39h15c3d72_0
+  - charset-normalizer=3.4.3=pyhd8ed1ab_0
+  - click=8.1.8=pyh707e725_0
+  - coin-or-cbc=2.10.12=h8b142ea_1
+  - coin-or-cgl=0.60.7=h516709c_0
+  - coin-or-clp=1.17.8=h1ee7a9c_0
+  - coin-or-osi=0.108.10=haf5fa05_0
+  - coin-or-utils=2.11.11=hee58242_0
+  - coincbc=2.10.12=4_metapackage
+  - colorama=0.4.6=pyhd8ed1ab_1
+  - coloredlogs=15.0.1=pyhd8ed1ab_4
+  - conda-gcc-specs=15.2.0=h53410ce_16
+  - configargparse=1.7.1=pyhe01879c_0
+  - connection_pool=0.0.3=pyhd3deb0d_0
+  - contourpy=1.3.0=py39h74842e3_2
+  - cryptography=45.0.6=py39hb2f7f84_0
+  - curl=8.8.0=he654da7_1
+  - cycler=0.12.1=pyhd8ed1ab_1
+  - dadi=2.4.3=py39hf4f1cb0_0
+  - datrie=0.8.2=py39h8cd3c5a_8
+  - dbus=1.13.6=h5008d03_3
+  - defusedxml=0.7.1=pyhd8ed1ab_0
+  - demes=0.2.3=pyhd8ed1ab_1
+  - dmd=2.065.0=1
+  - docutils=0.22=pyhd8ed1ab_0
+  - dpath=2.2.0=pyha770c72_0
+  - dropbox=12.0.2=pyhd8ed1ab_1
+  - eido=0.2.4=pyhd8ed1ab_0
+  - entrez-direct=22.4=he881be0_0
+  - exceptiongroup=1.3.0=pyhd8ed1ab_0
+  - expat=2.7.3=hecca717_0
+  - fastsimcoal2=27093=hdfd78af_0
+  - filechunkio=1.8=py_2
+  - font-ttf-dejavu-sans-mono=2.37=hab24e00_0
+  - font-ttf-inconsolata=3.000=h77eed37_0
+  - font-ttf-source-code-pro=2.038=h77eed37_0
+  - font-ttf-ubuntu=0.83=h77eed37_3
+  - fontconfig=2.14.2=h14ed4e7_0
+  - fonts-conda-ecosystem=1=0
+  - fonts-conda-forge=1=hc364b38_1
+  - fonttools=4.59.1=py39heb7d2ae_0
+  - freetype=2.12.1=h267a509_2
+  - fribidi=1.0.16=hb03c661_0
+  - frozenlist=1.7.0=py39h53edacf_0
+  - ftputil=5.1.0=pyhd8ed1ab_0
+  - gcc=15.2.0=h0dff253_16
+  - gcc_impl_linux-64=15.2.0=hc5723f1_16
+  - gfortran_impl_linux-64=15.2.0=h281d09f_16
+  - giflib=5.2.2=hd590300_0
+  - git=2.45.1=pl5321hef9f9f3_0
+  - gitdb=4.0.12=pyhd8ed1ab_0
+  - gitpython=3.1.45=pyhff2d567_0
+  - glib=2.80.2=hf974151_0
+  - glib-tools=2.80.2=hb6ce0ca_0
+  - gnuplot=5.0.3=4
+  - google-api-core=2.25.1=pyhd8ed1ab_0
+  - google-api-python-client=2.179.0=pyhff2d567_0
+  - google-auth=2.40.3=pyhd8ed1ab_0
+  - google-auth-httplib2=0.2.0=pyhd8ed1ab_1
+  - google-cloud-core=2.4.3=pyhd8ed1ab_0
+  - google-cloud-storage=3.3.0=pyhd8ed1ab_0
+  - google-crc32c=1.7.1=py39h2cad9fb_0
+  - google-resumable-media=2.7.2=pyhd8ed1ab_2
+  - googleapis-common-protos=1.70.0=pyhd8ed1ab_0
+  - graphite2=1.3.14=hecca717_2
+  - grpcio=1.46.3=py39h7fbbf82_0
+  - gsl=2.7=he838d99_0
+  - gst-plugins-base=1.24.4=h9ad1361_0
+  - gstreamer=1.24.4=haf2f30d_0
+  - gxx=15.2.0=h76987e4_16
+  - gxx_impl_linux-64=15.2.0=hda75c37_16
+  - harfbuzz=9.0.0=hfac3d4d_0
+  - htslib=1.21=h5efdd21_0
+  - httplib2=0.22.0=pyhd8ed1ab_1
+  - humanfriendly=10.0=pyh707e725_8
+  - icu=73.2=h59595ed_0
+  - idna=3.10=pyhd8ed1ab_1
+  - importlib-resources=6.5.2=pyhd8ed1ab_0
+  - importlib_resources=6.5.2=pyhd8ed1ab_0
+  - iniconfig=2.0.0=pyhd8ed1ab_1
+  - invoke=2.2.0=pyhd8ed1ab_1
+  - jinja2=3.1.6=pyhd8ed1ab_0
+  - jmespath=1.0.1=pyhd8ed1ab_1
+  - jsonschema=4.25.1=pyhe01879c_0
+  - jsonschema-specifications=2025.4.1=pyh29332c3_0
+  - jupyter_core=5.8.1=pyh31011fe_0
+  - k8=0.2.5=hdcf5f25_4
+  - kernel-headers_linux-64=4.18.0=he073ed8_9
+  - keyutils=1.6.3=hb9d3cd8_0
+  - kiwisolver=1.4.7=py39h74842e3_0
+  - krb5=1.21.3=h659f571_0
+  - lame=3.100=h166bdaf_1003
+  - lcms2=2.16=hb7c19ff_0
+  - ld_impl_linux-64=2.45=bootstrap_ha15bf96_4
+  - lerc=4.0.0=h0aef613_1
+  - libblas=3.11.0=5_h4a7cf45_openblas
+  - libbrotlicommon=1.2.0=hb03c661_1
+  - libbrotlidec=1.2.0=hb03c661_1
+  - libbrotlienc=1.2.0=hb03c661_1
+  - libcap=2.77=h3ff7636_0
+  - libcblas=3.11.0=5_h0358290_openblas
+  - libclang-cpp15=15.0.7=default_h127d8a8_5
+  - libclang13=18.1.7=default_h087397f_0
+  - libcrc32c=1.1.2=h9c3ff4c_0
+  - libcups=2.3.3=h4637d8d_4
+  - libcurl=8.8.0=hca28451_1
+  - libdeflate=1.20=hd590300_0
+  - libedit=3.1.20250104=pl5321h7949ede_0
+  - libev=4.33=hd590300_2
+  - libevent=2.1.12=hf998b51_1
+  - libexpat=2.7.3=hecca717_0
+  - libffi=3.5.2=h9ec8514_0
+  - libflac=1.5.0=he200343_1
+  - libgcc=15.2.0=he0feb66_16
+  - libgcc-devel_linux-64=15.2.0=hcc6f6b0_116
+  - libgcc-ng=15.2.0=h69a702a_16
+  - libgd=2.3.3=h119a65a_9
+  - libgfortran=15.2.0=h69a702a_16
+  - libgfortran-ng=15.2.0=h69a702a_16
+  - libgfortran5=15.2.0=h68bc16d_16
+  - libglib=2.80.2=hf974151_0
+  - libgomp=15.2.0=he0feb66_16
+  - libiconv=1.18=h3b78370_2
+  - libidn2=2.3.8=hfac485b_1
+  - libjpeg-turbo=3.1.2=hb03c661_0
+  - liblapack=3.11.0=5_h47877c9_openblas
+  - liblapacke=3.11.0=5_h6ae95b6_openblas
+  - libllvm15=15.0.7=hb3ce162_4
+  - libllvm18=18.1.7=hb77312f_0
+  - liblzma=5.8.1=hb9d3cd8_2
+  - liblzma-devel=5.8.1=hb9d3cd8_2
+  - libnghttp2=1.58.0=h47da74e_1
+  - libnsl=2.0.1=hb9d3cd8_1
+  - libogg=1.3.5=hd0c01bc_1
+  - libopenblas=0.3.30=pthreads_h94d23a6_4
+  - libopus=1.5.2=hd0c01bc_0
+  - libpng=1.6.43=h2797004_0
+  - libpq=16.11=hc183893_2
+  - libsanitizer=15.2.0=h90f66d4_16
+  - libsndfile=1.2.2=hc7d488a_2
+  - libsodium=1.0.20=h4ab18f5_0
+  - libsqlite=3.46.0=hde9e2c9_0
+  - libssh2=1.11.0=h0841786_0
+  - libstdcxx=15.2.0=h934c35e_16
+  - libstdcxx-devel_linux-64=15.2.0=hd446a21_116
+  - libstdcxx-ng=15.2.0=hdf11a46_16
+  - libsystemd0=257.10=hd0affe5_3
+  - libtiff=4.6.0=h1dd3fc0_3
+  - libunistring=0.9.10=h7f98852_0
+  - libuuid=2.41.2=h5347b49_1
+  - libvorbis=1.3.7=h54a6638_2
+  - libwebp=1.4.0=h2c329e2_0
+  - libwebp-base=1.4.0=hd590300_0
+  - libxcb=1.15=h0b41bf4_0
+  - libxcrypt=4.4.36=hd590300_1
+  - libxkbcommon=1.7.0=h662e7e4_0
+  - libxml2=2.12.7=hc051c1a_1
+  - libzlib=1.2.13=h4ab18f5_6
+  - logmuse=0.2.8=pyhd8ed1ab_1
+  - make=4.4.1=hb9d3cd8_2
+  - markdown-it-py=3.0.0=pyhd8ed1ab_1
+  - markupsafe=3.0.2=py39h9399b63_1
+  - matplotlib=3.9.1=py39hf3d152e_1
+  - matplotlib-base=3.9.1=py39h0565ad7_2
+  - mdurl=0.1.2=pyhd8ed1ab_1
+  - minimap2=2.28=he4a0461_3
+  - mpg123=1.32.9=hc50e24c_0
+  - msmc2=2.1.4=hdfd78af_0
+  - multidict=6.6.3=py39h9399b63_0
+  - munkres=1.1.4=pyhd8ed1ab_1
+  - mysql-common=8.3.0=hf1915f5_4
+  - mysql-libs=8.3.0=hca2cd23_4
+  - nbformat=5.10.4=pyhd8ed1ab_1
+  - ncbi-vdb=3.3.0=h9948957_0
+  - ncurses=6.5=h2d0b736_3
+  - nlopt=2.10.0=py39hca4a52a_0
+  - nspr=4.38=h29cc59b_0
+  - nss=3.100=hca3bf56_0
+  - numpy=2.0.2=py39h9cb892a_1
+  - oauth2client=4.1.3=pyhd8ed1ab_1
+  - openjdk=21.0.3=hb622114_0
+  - openjpeg=2.5.2=h488ebb8_0
+  - openssl=3.6.0=h26f9b46_0
+  - packaging=25.0=pyh29332c3_1
+  - pandas=2.3.1=py39h1b6b32d_0
+  - pango=1.54.0=h4c5309f_1
+  - paramiko=4.0.0=pyhd8ed1ab_0
+  - pcre2=10.43=hcad00b1_0
+  - pephubclient=0.4.4=pyhd8ed1ab_1
+  - peppy=0.40.7=pyhd8ed1ab_2
+  - perl=5.32.1=7_hd590300_perl5
+  - perl-archive-tar=3.04=pl5321hdfd78af_0
+  - perl-carp=1.38=pl5321hdfd78af_4
+  - perl-common-sense=3.75=pl5321hdfd78af_0
+  - perl-compress-raw-bzip2=2.214=pl5321hda65f42_0
+  - perl-compress-raw-zlib=2.214=pl5321h4dac143_0
+  - perl-encode=3.19=pl5321hec16e2b_1
+  - perl-exporter=5.72=pl5321hdfd78af_2
+  - perl-exporter-tiny=1.002002=pl5321hdfd78af_0
+  - perl-extutils-makemaker=7.70=pl5321hd8ed1ab_0
+  - perl-io-compress=2.214=pl5321h503566f_0
+  - perl-io-zlib=1.15=pl5321hdfd78af_1
+  - perl-json=4.10=pl5321hdfd78af_1
+  - perl-json-xs=4.04=pl5321h9948957_0
+  - perl-list-moreutils=0.430=pl5321hdfd78af_0
+  - perl-list-moreutils-xs=0.430=pl5321h7b50bb2_5
+  - perl-parent=0.236=pl5321hdfd78af_2
+  - perl-pathtools=3.75=pl5321hec16e2b_3
+  - perl-scalar-list-utils=1.62=pl5321hec16e2b_1
+  - perl-types-serialiser=1.01=pl5321hdfd78af_0
+  - pillow=10.3.0=py39h90c7501_0
+  - pip=25.2=pyh8b19718_0
+  - pixman=0.46.4=h54a6638_1
+  - plac=1.4.5=pyhd8ed1ab_0
+  - platformdirs=4.3.8=pyhe01879c_0
+  - plink=1.90b7.7=h7b50bb2_0
+  - pluggy=1.6.0=pyhf9edf01_1
+  - ply=3.11=pyhd8ed1ab_3
+  - prettytable=3.16.0=pyhd8ed1ab_0
+  - propcache=0.3.1=py39h9399b63_0
+  - proto-plus=1.26.1=pyhd8ed1ab_0
+  - protobuf=5.28.3=py39hf88036b_0
+  - psmc=0.6.5=h43eeafb_3
+  - psutil=7.0.0=py39h8cd3c5a_0
+  - pthread-stubs=0.4=hb9d3cd8_1002
+  - pulp=2.7.0=py39hf3d152e_1
+  - pulseaudio-client=17.0=hb77b528_0
+  - pyasn1=0.6.1=pyhd8ed1ab_2
+  - pyasn1-modules=0.4.2=pyhd8ed1ab_0
+  - pycparser=2.22=pyh29332c3_1
+  - pydantic=2.11.7=pyh3cfb1c2_0
+  - pydantic-core=2.33.2=py39h20260ba_0
+  - pygments=2.19.2=pyhd8ed1ab_0
+  - pynacl=1.5.0=py39h8cd3c5a_4
+  - pyopenssl=25.1.0=pyhd8ed1ab_0
+  - pyparsing=3.2.3=pyhe01879c_2
+  - pyqt=5.15.9=py39h52134e7_5
+  - pyqt5-sip=12.12.2=py39h3d6467e_5
+  - pysftp=0.2.9=py_1
+  - pysocks=1.7.1=pyha55dd90_7
+  - pytest=8.4.1=pyhd8ed1ab_0
+  - python=3.9.19=h0755675_0_cpython
+  - python-dateutil=2.9.0.post0=pyhe01879c_2
+  - python-fastjsonschema=2.21.2=pyhe01879c_0
+  - python-irodsclient=3.1.1=pyhff2d567_1
+  - python-tzdata=2025.2=pyhd8ed1ab_0
+  - python_abi=3.9=8_cp39
+  - pytz=2025.2=pyhd8ed1ab_0
+  - pyu2f=0.1.5=pyhd8ed1ab_1
+  - pyvcf=0.6.8=py39hf3d152e_1003
+  - pyyaml=6.0.2=py39h9399b63_2
+  - qhull=2020.2=h434a139_5
+  - qt-main=5.15.8=hc9dc06e_21
+  - r-base=4.4.0=h019f4a6_1
+  - rapidnj=2.3.2=h9948957_6
+  - readline=8.3=h853b02a_0
+  - referencing=0.36.2=pyh29332c3_0
+  - requests=2.32.5=pyhd8ed1ab_0
+  - reretry=0.11.8=pyhd8ed1ab_1
+  - rich=14.1.0=pyhe01879c_0
+  - rpds-py=0.27.0=py39h17f49b6_0
+  - rpsbproc=0.5.0=h6a68c12_1
+  - rsa=4.9.1=pyhd8ed1ab_0
+  - ruamel.yaml=0.18.15=py39hd399759_0
+  - ruamel.yaml.clib=0.2.8=py39h8cd3c5a_1
+  - s3transfer=0.13.1=pyhd8ed1ab_0
+  - samtools=1.21=h50ea8bc_0
+  - scipy=1.13.1=py39haf93ffa_0
+  - sed=4.9=h6688a6e_0
+  - seqtk=1.4=he4a0461_2
+  - setuptools=80.9.0=pyhff2d567_0
+  - shellingham=1.5.4=pyhd8ed1ab_1
+  - sip=6.7.12=py39h3d6467e_0
+  - six=1.17.0=pyhe01879c_1
+  - slacker=0.14.0=pyhd8ed1ab_1
+  - slim=5.1=hecca717_0
+  - smart_open=7.3.0.post1=pyhe01879c_0
+  - smmap=5.0.2=pyhd8ed1ab_0
+  - snakemake=7.32.4=hdfd78af_1
+  - snakemake-minimal=7.32.4=pyhdfd78af_1
+  - snpeff=5.4.0a=hdfd78af_0
+  - sra-tools=2.9.6=hf484d3e_0
+  - stone=3.3.2=pyhd8ed1ab_0
+  - stopit=1.1.2=pyhd8ed1ab_1
+  - sysroot_linux-64=2.28=h4ee821c_9
+  - tabulate=0.9.0=pyhd8ed1ab_2
+  - throttler=1.2.2=pyhd8ed1ab_0
+  - tk=8.6.13=noxft_h4845f30_101
+  - tktable=2.10=h8d826fa_7
+  - toml=0.10.2=pyhd8ed1ab_1
+  - tomli=2.2.1=pyhe01879c_2
+  - toposort=1.10=pyhd8ed1ab_1
+  - tornado=6.5.2=py39hd399759_0
+  - traitlets=5.14.3=pyhd8ed1ab_1
+  - typer=0.16.1=pyhc167863_0
+  - typer-slim=0.16.1=pyhe01879c_0
+  - typer-slim-standard=0.16.1=h810d63d_0
+  - typing-extensions=4.14.1=h4440ef1_0
+  - typing-inspection=0.4.1=pyhd8ed1ab_0
+  - typing_extensions=4.14.1=pyhe01879c_0
+  - tzdata=2025c=h8577fbf_0
+  - ubiquerg=0.8.0=pyhd8ed1ab_0
+  - unicodedata2=16.0.0=py39h8cd3c5a_0
+  - unzip=6.0=hb03c661_4
+  - uritemplate=4.2.0=pyhd8ed1ab_0
+  - urllib3=1.26.19=pyhd8ed1ab_0
+  - vcftools=0.1.16=pl5321hdcf5f25_11
+  - veracitools=0.1.3=py_0
+  - wcwidth=0.2.13=pyhd8ed1ab_1
+  - wget=1.21.4=hda4d442_0
+  - wheel=0.45.1=pyhd8ed1ab_1
+  - wrapt=1.17.3=py39hd399759_0
+  - xcb-util=0.4.0=hd590300_1
+  - xcb-util-image=0.4.0=h8ee46fc_1
+  - xcb-util-keysyms=0.4.0=h8ee46fc_1
+  - xcb-util-renderutil=0.3.9=hd590300_1
+  - xcb-util-wm=0.4.1=h8ee46fc_1
+  - xkeyboard-config=2.42=h4ab18f5_0
+  - xorg-fixesproto=5.0=hb9d3cd8_1003
+  - xorg-inputproto=2.3.2=hb9d3cd8_1003
+  - xorg-kbproto=1.0.7=hb9d3cd8_1003
+  - xorg-libice=1.1.2=hb9d3cd8_0
+  - xorg-libsm=1.2.6=he73a12e_0
+  - xorg-libx11=1.8.9=h8ee46fc_0
+  - xorg-libxau=1.0.12=hb03c661_1
+  - xorg-libxdmcp=1.1.5=hb03c661_1
+  - xorg-libxext=1.3.4=h0b41bf4_2
+  - xorg-libxfixes=5.0.3=h7f98852_1004
+  - xorg-libxi=1.7.10=h4bc722e_1
+  - xorg-libxrender=0.9.11=hd590300_0
+  - xorg-libxt=1.3.0=hd590300_1
+  - xorg-libxtst=1.2.5=h4bc722e_0
+  - xorg-recordproto=1.14.2=hb9d3cd8_1003
+  - xorg-renderproto=0.11.1=hb9d3cd8_1003
+  - xorg-xextproto=7.3.0=hb9d3cd8_1004
+  - xorg-xf86vidmodeproto=2.3.1=hb9d3cd8_1005
+  - xorg-xproto=7.0.31=hb9d3cd8_1008
+  - xz=5.8.1=hbcc6ac9_2
+  - xz-gpl-tools=5.8.1=hbcc6ac9_2
+  - xz-tools=5.8.1=hb9d3cd8_2
+  - yaml=0.2.5=h280c20c_3
+  - yarl=1.20.1=py39h9399b63_0
+  - yte=1.8.1=pyha770c72_1
+  - zipp=3.23.0=pyhd8ed1ab_0
+  - zlib=1.2.13=h4ab18f5_6
+  - zstd=1.5.6=ha6fb4c9_0
+  - pip:
+      - seaborn==0.13.2
+prefix: /home/shestun/miniconda3/envs/genomics_full
+
+
+==================================================
+
+scripts/plot_roh.py:
+import sys
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+roh_file = sys.argv[1]
+out_plot = sys.argv[2]
+
+try:
+    df = pd.read_csv(roh_file, sep='\s+')
+    # ОЧИСТКА ИМЕН: убираем путь и расширение, оставляем только ID
+    df['IID'] = df['IID'].astype(str).apply(lambda x: os.path.basename(x).split('.')[0])
+except Exception as e:
+    plt.figure(); plt.text(0.5, 0.5, f"Error: {e}"); plt.savefig(out_plot); sys.exit()
+
+GENOME_LEN = 1.2e9 
+froh = df.groupby('IID')['KB'].sum() * 1000 / GENOME_LEN
+froh = froh.reset_index(name='F_ROH')
+n_roh = df.groupby('IID')['KB'].count().reset_index(name='N_ROH')
+data = pd.merge(froh, n_roh, on='IID')
+
+plt.figure(figsize=(12, 7))
+sns.scatterplot(data=data, x='N_ROH', y='F_ROH', s=200, color='darkred', alpha=0.7, edgecolor='black')
+
+for i in range(data.shape[0]):
+    plt.text(data.N_ROH[i] + 0.1, data.F_ROH[i], data.IID[i], fontsize=9, verticalalignment='bottom')
+
+plt.xlabel("Number of ROH segments (N_ROH)")
+plt.ylabel("Inbreeding Coefficient (F_ROH)")
+plt.title("Genomic Inbreeding: Runs of Homozygosity Analysis")
+plt.grid(True, alpha=0.3, linestyle='--')
+plt.savefig(out_plot, dpi=300)
+
+
+==================================================
+
+scripts/run_slim_dynamic.py:
+import sys
+import subprocess
+import matplotlib.pyplot as plt
+
+param_file = sys.argv[1]
+out_plot = sys.argv[2]
+
+p = {}
+with open(param_file) as f:
+    for line in f:
+        k, v = line.strip().split('=')
+        p[k] = int(v)
+
+Q = 500 # Оптимальное ускорение
+N_ANC = int(p['N_ANC']/Q); N_BOT = int(p['N_BOT']/Q); N_CUR = int(p['N_CUR']/Q)
+T_BOT = int(p['T_BOT_DUR_GEN']/Q); T_REC = int(p['T_REC_AGO_GEN']/Q)
+
+# Современный кризис (реальные 25 000 птиц -> Ne примерно 2500)
+N_CRISIS = int(2500 / Q)
+if N_CRISIS < 2: N_CRISIS = 2
+
+T_BURNIN = 500
+T_START_BOT = T_BURNIN
+T_START_REC = T_START_BOT + T_BOT
+T_START_CRISIS = T_START_REC + T_REC
+T_END = T_START_CRISIS + 100 # Моделируем 100 поколений кризиса
+
+slim_code = f"""
+initialize() {{
+    initializeMutationRate(1e-7 * {Q}); 
+    initializeMutationType("m1", 0.5, "f", 0.0);
+    initializeMutationType("m2", 0.1, "g", -0.05, 0.2); // Вредные
+    initializeGenomicElementType("g1", c(m1, m2), c(1.0, 0.5));
+    for (i in 0:9) {{ initializeGenomicElement(g1, i*2000, i*2000 + 999); }}
+    initializeRecombinationRate(1e-8 * {Q});
+}}
+1 early() {{ sim.addSubpop("p1", {N_ANC}); }}
+1:{T_END} late() {{
+    if (community.tick % 10 == 0) {{
+        load = mean(p1.individuals.countOfMutationsOfType(m2));
+        cat(community.tick + "," + load + "\\n");
+    }}
+}}
+{T_START_BOT} early() {{ p1.setSubpopulationSize({N_BOT}); }}
+{T_START_REC} early() {{ p1.setSubpopulationSize({N_CUR}); }}
+{T_START_CRISIS} early() {{ p1.setSubpopulationSize({N_CRISIS}); }}
+"""
+
+with open("model.slim", "w") as f: f.write(slim_code)
+res = subprocess.run(["slim", "model.slim"], capture_output=True, text=True)
+
+gens, loads = [], []
+for line in res.stdout.splitlines():
+    if "," in line:
+        parts = line.split(","); gens.append(int(parts[0])); loads.append(float(parts[1]))
+
+plt.figure(figsize=(10, 6))
+plt.plot(gens, loads, 'r-', lw=2)
+plt.axvline(T_START_BOT, ls='--', color='black', label="Ancient Bottleneck")
+plt.axvline(T_START_REC, ls='--', color='blue', label="Recovery")
+plt.axvline(T_START_CRISIS, ls='--', color='red', label="Modern Crisis")
+plt.title("Evolution of Mutational Load (with Modern Crisis)")
+plt.legend(); plt.savefig(out_plot)
+
+
+==================================================
+
+scripts/run_snmf.R:
+args <- commandArgs(trailingOnly = TRUE)
+input_vcf <- args[1]
+k_min <- as.integer(args[2])
+k_max <- as.integer(args[3])
+reps <- as.integer(args[4])
+out_plot <- args[5]
+
+if (!requireNamespace("LEA", quietly = TRUE)) {
+    stop("Package LEA is not installed. Run: conda install -c bioconda bioconductor-lea")
+}
+library(LEA)
+
+# Конвертация VCF в формат GENO (требуется для sNMF)
+# output будет input_vcf.geno
+geno_file <- vcf2geno(input_vcf, output = paste0(input_vcf, ".geno"), force=TRUE)
+
+# Запуск sNMF
+project <- snmf(geno_file, K = k_min:k_max, entropy = TRUE, repetitions = reps, project = "new")
+
+# Рисуем график кросс-энтропии
+png(out_plot)
+plot(project, col = "blue", pch = 19, cex = 1.2)
+dev.off()
+
+# Лучший K (минимальная энтропия)
+best_K <- which.min(cross.entropy(project, K = k_min:k_max))
+print(paste("Best K seems to be:", best_K))
+
+
+==================================================
+
+scripts/make_sfs.py:
+import dadi
+import matplotlib.pyplot as plt
+import sys
+
+vcf_file = sys.argv[1]
+pop_file = sys.argv[2]
+out_sfs = sys.argv[3]
+out_plot = sys.argv[4]
+
+dd = dadi.Misc.make_data_dict_vcf(vcf_file, pop_file)
+pop_ids = ['Spoonbill']
+proj_n = [40] 
+
+fs = dadi.Spectrum.from_data_dict(dd, pop_ids=pop_ids, projections=proj_n, polarized=False)
+fs.to_file(out_sfs)
+
+plt.figure(figsize=(10, 6))
+dadi.Plotting.plot_1d_fs(fs)
+plt.title("SFS Spoonbill")
+plt.savefig(out_plot)
+
+
+==================================================
+
+scripts/extract_lower.py:
+import sys
+from Bio import SeqIO
+
+if len(sys.argv) < 2:
+    sys.exit("Usage: extract_lower.py input.fasta")
+
+fasta_file = sys.argv[1]
+
+for record in SeqIO.parse(fasta_file, "fasta"):
+    seq = str(record.seq)
+    in_mask = False
+    start = 0
+    for i, base in enumerate(seq):
+        is_lower = base.islower()
+        if is_lower and not in_mask:
+            start = i
+            in_mask = True
+        elif not is_lower and in_mask:
+            print(f"{record.id}\t{start}\t{i}")
+            in_mask = False
+    if in_mask:
+        print(f"{record.id}\t{start}\t{len(seq)}")
+
+
+==================================================
+
+scripts/find_cpg.py:
+import sys
+from Bio import SeqIO
+
+if len(sys.argv) < 2:
+    sys.exit("Usage: find_cpg.py input.fasta")
+
+fasta_file = sys.argv[1]
+
+for record in SeqIO.parse(fasta_file, "fasta"):
+    seq = str(record.seq).upper()
+    start = 0
+    while True:
+        idx = seq.find("CG", start)
+        if idx == -1:
+            break
+        print(f"{record.id}\t{idx}\t{idx+2}")
+        start = idx + 1
+
+
+==================================================
+
+scripts/plot_structure.py:
+import sys
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import dendrogram, linkage
+import numpy as np
+
+# Аргументы от Snakemake
+eigenvec_f = sys.argv[1]
+eigenval_f = sys.argv[2]
+mibs_f = sys.argv[3]
+mibs_id_f = sys.argv[4]
+out_pca = sys.argv[5]
+out_tree = sys.argv[6]
+
+# --- PCA ---
+try:
+    pca_data = pd.read_csv(eigenvec_f, sep='\s+', header=None)
+    eigenval = pd.read_csv(eigenval_f, header=None)
+    pca_data.columns = ['FID', 'IID'] + [f'PC{i+1}' for i in range(len(pca_data.columns)-2)]
+
+    total_variance = eigenval[0].sum()
+    pc1_var = round((eigenval[0][0] / total_variance) * 100, 2)
+    pc2_var = round((eigenval[0][1] / total_variance) * 100, 2)
+
+    plt.figure(figsize=(10, 8))
+    plt.scatter(pca_data['PC1'], pca_data['PC2'], s=50)
+    for i, txt in enumerate(pca_data['IID']):
+        plt.annotate(txt, (pca_data['PC1'][i], pca_data['PC2'][i]), fontsize=8, alpha=0.75)
+    plt.xlabel(f'PC1 ({pc1_var}%)'); plt.ylabel(f'PC2 ({pc2_var}%)')
+    plt.grid(True)
+    plt.savefig(out_pca)
+except Exception as e:
+    print(f"Error plotting PCA: {e}")
+
+# --- Dendrogram ---
+try:
+    dist_matrix = np.loadtxt(mibs_f)
+    ids_ibs = pd.read_csv(mibs_id_f, sep='\s+', header=None)
+    num_samples = len(ids_ibs)
+    dissimilarities = dist_matrix[np.tril_indices(num_samples, k=-1)]
+    linked = linkage(1 - dissimilarities, method='ward')
+
+    plt.figure(figsize=(12, 7))
+    dendrogram(linked, orientation='top', labels=ids_ibs[1].tolist(), distance_sort='descending', show_leaf_counts=True)
+    plt.xticks(rotation=90); plt.tight_layout()
+    plt.savefig(out_tree)
+except Exception as e:
+    print(f"Error plotting Tree: {e}")
+
+
+==================================================
+
+scripts/count_and_plot_load.py:
+import vcf
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import sys
+import numpy as np
+
+VCF_FILE = sys.argv[1]
+OUT_PLOT = sys.argv[2]
+
+try:
+    vcf_reader = vcf.Reader(filename=VCF_FILE)
+except:
+    print("Error opening VCF or empty file.")
+    sys.exit(0)
+
+load_counts = {sample: {'syn_het': 0, 'syn_hom': 0, 'mis_het': 0, 'mis_hom': 0, 'lof_het': 0, 'lof_hom': 0} for sample in vcf_reader.samples}
+count = 0
+
+for record in vcf_reader:
+    count += 1
+    if 'ANN' not in record.INFO: continue
+    ann_str = record.INFO['ANN'][0]
+    try: impact = ann_str.split('|')[2]
+    except IndexError: continue
+    
+    category = None
+    if impact == 'LOW': category = 'syn'
+    elif impact == 'MODERATE': category = 'mis'
+    elif impact == 'HIGH': category = 'lof'
+    if category is None: continue
+
+    for sample in record.samples:
+        if not sample.called: continue
+        if sample.gt_type == 1: load_counts[sample.sample][f'{category}_het'] += 1
+        elif sample.gt_type == 2: load_counts[sample.sample][f'{category}_hom'] += 1
+
+if count == 0:
+    print("No variants found in annotated VCF.")
+    plt.figure()
+    plt.text(0.5, 0.5, "No Data found")
+    plt.savefig(OUT_PLOT)
+    sys.exit(0)
+
+df = pd.DataFrame.from_dict(load_counts, orient='index')
+df.index.name = 'IID'; df.reset_index(inplace=True)
+df['syn_total'] = df['syn_hom'] + df['syn_het']
+df['mis_total'] = df['mis_hom'] + df['mis_het']
+df['lof_total'] = df['lof_hom'] + df['lof_het']
+
+# Защита от деления на ноль
+df['Ratio_LoF_Syn'] = df.apply(lambda row: row['lof_total'] / row['syn_total'] if row['syn_total'] > 0 else 0, axis=1)
+df['Ratio_Mis_Syn'] = df.apply(lambda row: row['mis_total'] / row['syn_total'] if row['syn_total'] > 0 else 0, axis=1)
+
+plot_df = df[['Ratio_LoF_Syn', 'Ratio_Mis_Syn']].melt(var_name='Type', value_name='Ratio')
+
+plt.figure(figsize=(10, 8))
+if not plot_df.empty:
+    # Исправление для Seaborn: hue=Type и legend=False
+    sns.boxplot(x='Type', y='Ratio', hue='Type', data=plot_df, palette="Pastel1", legend=False)
+    sns.stripplot(x='Type', y='Ratio', data=plot_df, color='black', alpha=0.6, jitter=True)
+
+plt.savefig(OUT_PLOT)
+
+
+==================================================
+
+scripts/run_final_slim.py:
+import os
+import subprocess
+import matplotlib.pyplot as plt
+import sys
+
+OUT_PLOT = sys.argv[1]
+
+# Параметры (как в вашем примере)
+N_ANC = 68440; N_BOT = 20; N_CUR = 16530
+GEN_TIME = 4
+Q = 10 # Scaling
+
+N_ANC_S = int(N_ANC / Q); N_BOT_S = int(N_BOT); N_CUR_S = int(N_CUR / Q)
+T_BOT_DUR_S = int((10895 / GEN_TIME) / Q)
+T_REC_AGO_S = int((114219 / GEN_TIME) / Q)
+T_START_BOT = 5000
+T_START_REC = T_START_BOT + T_BOT_DUR_S
+T_END = T_START_REC + T_REC_AGO_S
+
+slim_code = f"""
+initialize() {{
+    initializeMutationRate(1e-7 * {Q}); 
+    initializeMutationType("m1", 0.5, "f", 0.0);
+    initializeMutationType("m2", 0.05, "g", -0.05, 0.2); 
+    initializeGenomicElementType("g1", c(m1, m2), c(1.0, 2.0));
+    for (i in 0:49) {{ initializeGenomicElement(g1, i*2000, i*2000 + 999); }}
+    initializeRecombinationRate(1e-8 * {Q});
+}}
+1 early() {{ sim.addSubpop("p1", {N_ANC_S}); }}
+1:{T_END} late() {{
+    if (community.tick % 100 == 0) {{
+        if (p1.individualCount > 0) {{
+            inds = p1.individuals;
+            total_m2 = mean(inds.countOfMutationsOfType(m2));
+            cat(community.tick + "," + total_m2 + "\\n");
+        }}
+    }}
+}}
+{T_START_BOT} early() {{ p1.setSubpopulationSize({N_BOT_S}); }}
+{T_START_REC} early() {{ p1.setSubpopulationSize({N_CUR_S}); }}
+"""
+
+with open("temp_model.slim", "w") as f: f.write(slim_code)
+res = subprocess.run(["slim", "temp_model.slim"], capture_output=True, text=True)
+
+gens, loads = [], []
+for line in res.stdout.splitlines():
+    if "," in line and not line.startswith("Gen"):
+        p = line.split(",")
+        try: gens.append(int(p[0])); loads.append(float(p[1]))
+        except: pass
+
+if len(gens) > 0:
+    plt.figure(figsize=(10, 6))
+    plt.plot(gens, loads, color="red")
+    plt.axvline(x=T_START_BOT, linestyle='--'); plt.axvline(x=T_START_REC, linestyle='--')
+    plt.savefig(OUT_PLOT)
+
+
+==================================================
+
+scripts/detect_sex_scaffolds.py:
+import sys
+import pandas as pd
+
+# Аргументы: 1=blast_Z, 2=blast_W, 3=output_list
+blast_z_file = sys.argv[1]
+blast_w_file = sys.argv[2]
+output_file = sys.argv[3]
+
+def get_top_scaffolds(blast_file, top_n=5):
+    try:
+        # Читаем формат outfmt 6
+        df = pd.read_csv(blast_file, sep='\t', header=None, 
+                         names=['qseqid', 'sseqid', 'pident', 'length', 'mismatch', 'gapopen', 
+                                'qstart', 'qend', 'sstart', 'send', 'evalue', 'bitscore'])
+        # Суммируем длину совпадений для каждого скаффолда
+        scaffold_counts = df.groupby('sseqid')['length'].sum().sort_values(ascending=False)
+        return scaffold_counts.head(top_n).index.tolist()
+    except pd.errors.EmptyDataError:
+        return []
+
+z_scaffolds = get_top_scaffolds(blast_z_file)
+w_scaffolds = get_top_scaffolds(blast_w_file)
+
+# Объединяем уникальные
+sex_scaffolds = sorted(list(set(z_scaffolds + w_scaffolds)))
+
+with open(output_file, 'w') as f:
+    for scaf in sex_scaffolds:
+        f.write(f"{scaf}\n")
+
+print(f"Detected {len(sex_scaffolds)} sex scaffolds: {sex_scaffolds}")
+
+
+==================================================
+
+scripts/dadi_inference.py:
+import sys
+import dadi
+import matplotlib.pyplot as plt
+import numpy as np
+
+vcf_file = sys.argv[1]
+pop_map = sys.argv[2]
+out_params = sys.argv[3]
+out_plot = sys.argv[4]
+
+# Загрузка данных
+dd = dadi.Misc.make_data_dict_vcf(vcf_file, pop_map)
+# Проекция на 40 гаплотипов (для 22 особей)
+fs = dadi.Spectrum.from_data_dict(dd, ['Spoonbill'], [40], polarized=False)
+
+def bottleneck(params, ns, pts):
+    nuB, nuF, TB, TF = params
+    xx = dadi.Numerics.default_grid(pts)
+    phi = dadi.PhiManip.phi_1D(xx)
+    phi = dadi.Integration.one_pop(phi, xx, TB, nuB)
+    phi = dadi.Integration.one_pop(phi, xx, TF, nuF)
+    return dadi.Spectrum.from_phi(phi, ns, (xx,))
+
+pts_l = [40, 50, 60]
+func_ex = dadi.Numerics.make_extrap_log_func(bottleneck)
+# Запуск оптимизации
+popt = dadi.Inference.optimize_log([0.1, 1.1, 0.1, 0.1], fs, func_ex, pts_l, 
+                                   lower_bound=[1e-3, 1e-2, 1e-3, 1e-3], upper_bound=[1, 10, 1, 1], maxiter=30)
+
+# РИСОВАНИЕ (Исправлено)
+model = func_ex(popt, fs.sample_sizes, pts_l)
+fig = plt.figure(figsize=(10, 8))
+dadi.Plotting.plot_1d_comp_multinom(model, fs)
+plt.savefig(out_plot, dpi=150)
+
+# Расчет параметров
+theta = dadi.Inference.optimal_sfs_scaling(model, fs)
+N_anc = theta / (4 * 4.6e-9 * 1e8)
+nuB, nuF, TB, TF = popt
+
+with open(out_params, 'w') as f:
+    f.write(f"N_ANC={int(N_anc)}\nN_BOT={int(N_anc*nuB)}\nN_CUR={int(N_anc*nuF)}\n")
+    f.write(f"T_BOT_DUR_GEN={int(TB*2*N_anc)}\nT_REC_AGO_GEN={int(TF*2*N_anc)}\n")
+
+
+==================================================
+
+scripts/plot_windows.py:
+import sys
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+pi_file = sys.argv[1]
+tajima_file = sys.argv[2]
+out_plot = sys.argv[3]
+
+# Читаем Pi
+try:
+    df_pi = pd.read_csv(pi_file, sep='\t')
+    df_taj = pd.read_csv(tajima_file, sep='\t')
+except:
+    plt.figure(); plt.savefig(out_plot); sys.exit()
+
+fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+
+# График 1: Pi
+# Фильтруем слишком большие значения (ошибки) и NaN
+df_pi = df_pi[df_pi['PI'] < 0.1].dropna()
+sns.histplot(df_pi['PI'], bins=50, color='teal', ax=axes[0], kde=True)
+axes[0].set_title('Nucleotide Diversity (Pi) Distribution')
+axes[0].set_xlabel('Pi (per site)')
+
+# График 2: Tajima's D
+df_taj = df_taj.dropna()
+sns.histplot(df_taj['TajimaD'], bins=50, color='purple', ax=axes[1], kde=True)
+axes[1].set_title("Tajima's D Distribution")
+axes[1].set_xlabel("Tajima's D")
+axes[1].axvline(x=0, color='black', linestyle='--')
+
+plt.tight_layout()
+plt.savefig(out_plot)
+
+
+==================================================
+
+README.md:
+---
+
+# Пайплайн популяционной геномики кулика-лопатеня (*Calidris pygmaea*)
+
+Этот проект представляет собой автоматизированный вычислительный цикл (на базе **Snakemake**) для комплексного анализа полногеномных данных (WGS) исчезающего вида — кулика-лопатеня. Пайплайн решает задачи от первичной фильтрации до реконструкции демографической истории и оценки генетического здоровья популяции.
+
+## 🧬 Архитектура и этапы анализа
+
+Пайплайн разделен на 8 логических блоков, которые обеспечивают воспроизводимость и эффективность вычислений.
+
+### 1. Обработка половых хромосом (Sex ID)
+Поскольку сборка генома кулика выполнена на уровне скаффолдов, половые хромосомы (Z и W) не всегда аннотированы.
+*   **Метод:** Автоматическое скачивание эталонных хромосом Зебровой амадины (Z) и Курицы (W) с NCBI.
+*   **Инструмент:** `BLASTn` проводит поиск гомологичных участков в исследуемом геноме.
+*   **Результат:** Список скаффолдов, потенциально являющихся половыми хромосомами, для их последующего учета или исключения.
+
+### 2. Контроль качества и фильтрация (QC)
+Превращение "сырого" VCF в очищенный массив данных.
+*   **Инструменты:** `bcftools`, `vcftools`.
+*   **Логика:** Удаление индилей, мультиаллельных сайтов и фильтрация по качеству (QUAL).
+*   **Особенность:** Пайплайн использует "гибридный" подход:
+    *   **Full VCF:** Содержит все качественные SNP для анализа мутационного груза и Pi.
+    *   **Pruned VCF:** Прореженный набор данных (LD-pruning), где удалены сцепленные маркеры, для корректного PCA и dadi.
+
+### 3. Анализ структуры популяции (Structure & PCA)
+Определение генетической однородности 22 особей.
+*   **PCA (Principal Component Analysis):** Снижение размерности данных с помощью `PLINK` для визуализации кластеров особей.
+*   **sNMF (LEA R-package):** Оценка долей предковых популяций и расчет кросс-энтропии для определения оптимального числа групп (K).
+*   **Решение проблем:** Реализован механизм переименования скаффолдов "на лету" (mapping to Chromosome 1), что позволяет обходить ограничения PLINK 1.9 при работе со сборками scaffold-level.
+
+### 4. Реконструкция демографической истории (dadi)
+Моделирование численности популяции в прошлом.
+*   **Метод:** Анализ спектра частот аллелей (SFS).
+*   **Модель:** "Bottleneck-Recovery" (сокращение численности с последующим восстановлением).
+*   **Автоматизация:** Модель оптимизирует параметры ($N_e$, время событий) и автоматически генерирует файл параметров для следующего этапа (SLiM).
+
+### 5. Мутационный груз (Mutational Load)
+Оценка накопления вредных мутаций в геноме.
+*   **Инструмент:** `SnpEff`.
+*   **Логика:** Аннотация SNP на основе GFF-файла. Классификация мутаций на:
+    *   *Synonymous (тихие)* — нейтральный фон.
+    *   *Missense (слабо вредные)* — умеренное воздействие.
+    *   *Loss-of-Function (сильно вредные)* — поломка гена.
+*   **Метрика:** Расчет соотношения вредных мутаций к нейтральным для каждой особи.
+
+### 6. Эволюционное моделирование (SLiM 4)
+Проверка гипотезы о "генетической очистке" (Purging).
+*   **Метод:** Индивидуум-ориентированное моделирование (Forward-in-time simulation).
+*   **Связка:** SLiM получает реальные демографические параметры из `dadi`.
+*   **Задача:** Понять, привело ли историческое "бутылочное горлышко" к вымыванию вредных мутаций или к их накоплению.
+
+### 7. Анализ инбридинга (ROH)
+Поиск участков гомозиготности (Runs of Homozygosity).
+*   **Инструмент:** `PLINK --homozyg`.
+*   **Результат:** Расчет коэффициента инбридинга $F_{ROH}$ и визуализация истории спаривания родственников. Разделение на древний инбридинг (короткие участки) и современный (длинные участки).
+
+### 8. Геномное сканирование (Genomic Windows)
+Анализ распределения разнообразия вдоль генома.
+*   **Метрики:** Нуклеотидное разнообразие ($\pi$) и $Tajima's D$.
+*   **Окна:** Расчет в скользящих окнах по 50 кб.
+*   **Цель:** Поиск "островов отбора" — участков генома, критически важных для адаптации (например, форма клюва).
+
+---
+
+## 🛠 Технологический стек
+*   **Workflow Manager:** Snakemake
+*   **Languages:** Python 3, R, Bash
+*   **Genomics Tools:** bcftools, vcftools, PLINK 1.9, BLAST+, SnpEff, SLiM 4, dadi
+*   **Visualisation:** Matplotlib, Seaborn, LEA (R)
+
+## 📁 Структура проекта
+*   `Snakefile` — логика пайплайна.
+*   `config/config.yaml` — параметры фильтрации и пути к файлам.
+*   `scripts/` — кастомные Python/R скрипты для расчетов и графиков.
+*   `resources/` — исходные данные (VCF, FASTA, GFF).
+*   `results/` — автоматически создаваемая папка с результатами (графики, таблицы, логи).
+
+---
+*Пайплайн оптимизирован для работы в условиях ограниченных вычислительных ресурсов (WSL/Desktop) за счет использования интеллектуального прореживания данных (LD-pruning) и динамического масштабирования популяций в симуляциях.*
+
+
+==================================================
+
