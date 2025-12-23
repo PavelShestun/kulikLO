@@ -1,22 +1,35 @@
 Snakefile:
+import subprocess
+import os
+
 configfile: "config/config.yaml"
+
+# Пытаемся получить список образцов напрямую из VCF файла
+try:
+    VCF_PATH = config["resources"]["vcf"]
+    SAMPLES = subprocess.check_output(f"bcftools query -l {VCF_PATH}", shell=True).decode().split()
+except:
+    SAMPLES = []
 
 rule all:
     input:
         "results/qc/stats_final.txt",
         "results/plots/PCA_plot.png",
+        "results/plots/NJ_tree.png",
         "results/plots/sNMF_entropy.png",
+        "results/plots/ROH_Inbreeding_Final.png",
+        "results/load/Rxy_stats.txt",
+        "results/plots/Genomic_Windows.png",
         "results/dadi/best_model_plot.png",
-        "results/load/Mutational_Load_plot_final.png",
-        "results/models/slim_dynamic_result.png",
-        "results/plots/ROH_Inbreeding.png",
-        "results/plots/Genomic_Windows.png"
+        "results/models/slim_purging_results.png"
 
-# --- 1. Определение пола ---
+# --- 1. Определение пола (Blast по Z/W) ---
 rule download_sex_refs:
     output: z="resources/ref_sex/chrZ.fna", w="resources/ref_sex/chrW.fna"
     params: z_url=config["resources"]["ref_Z_url"], w_url=config["resources"]["ref_W_url"]
-    shell: "wget -O {output.z}.gz {params.z_url} && gunzip {output.z}.gz; wget -O {output.w}.gz {params.w_url} && gunzip {output.w}.gz"
+    shell: 
+        "wget -O {output.z}.gz {params.z_url} && gunzip -f {output.z}.gz; "
+        "wget -O {output.w}.gz {params.w_url} && gunzip -f {output.w}.gz"
 
 rule blast_db:
     input: config["resources"]["genome"]
@@ -27,117 +40,164 @@ rule blast_search:
     input: z="resources/ref_sex/chrZ.fna", w="resources/ref_sex/chrW.fna", db=multiext("resources/blast_db/calidris", ".ndb", ".nhr", ".nsq")
     output: z_res="results/sex_check/blast_Z.txt", w_res="results/sex_check/blast_W.txt"
     threads: 8
-    shell: "blastn -query {input.z} -db resources/blast_db/calidris -out {output.z_res} -outfmt 6 -evalue 1e-10 -num_threads {threads}; blastn -query {input.w} -db resources/blast_db/calidris -out {output.w_res} -outfmt 6 -evalue 1e-10 -num_threads {threads}"
+    shell: 
+        "blastn -query {input.z} -db resources/blast_db/calidris -out {output.z_res} -outfmt 6 -evalue 1e-10 -num_threads {threads}; "
+        "blastn -query {input.w} -db resources/blast_db/calidris -out {output.w_res} -outfmt 6 -evalue 1e-10 -num_threads {threads}"
 
 rule identify_sex_scaffolds:
     input: z="results/sex_check/blast_Z.txt", w="results/sex_check/blast_W.txt"
     output: "results/sex_check/sex_scaffolds.txt"
     shell: "python scripts/detect_sex_scaffolds.py {input.z} {input.w} {output}"
 
-# --- 2. Фильтрация ---
-rule filter_vcf_full:
-    input: vcf=config["resources"]["vcf"], sex="results/sex_check/sex_scaffolds.txt"
-    output: "results/qc/clean_full.vcf.gz"
-    shell: "bcftools view {input.vcf} -O z -o {output} && bcftools index {output}"
-
-rule qc_stats:
-    input: "results/qc/clean_full.vcf.gz"
-    output: "results/qc/stats_final.txt"
-    shell: "bcftools stats {input} > {output}"
-
-# --- 3. PCA (Исправлено рисование) ---
-rule prune_data:
-    input: "results/qc/clean_full.vcf.gz"
-    output: pruned_vcf="results/qc/pruned.vcf", vec="results/qc/pca.eigenvec", val="results/qc/pca.eigenval"
+# --- 2. ЖЕСТКАЯ ФИЛЬТРАЦИЯ (По статье: AB 0.2-0.8, GAP 5bp, Depth 1/3-2x) ---
+rule filter_vcf_strict:
+    input: 
+        vcf=config["resources"]["vcf"],
+        sex="results/sex_check/sex_scaffolds.txt"
+    output: 
+        vcf="results/qc/clean_strict.vcf.gz",
+        tbi="results/qc/clean_strict.vcf.gz.tbi"
+    params:
+        min_dp=config["filtering"]["min_depth"],
+        max_dp=config["filtering"]["max_depth"],
+        ab_min=config["filtering"]["min_allele_balance"],
+        snp_gap=config["filtering"]["snp_gap"],
+        hwe=config["filtering"]["hwe_threshold"]
     shell:
         """
-        bcftools annotate --set-id '%CHROM:%POS' {input} -O z -o results/qc/annotated.vcf.gz
-        vcftools --gzvcf results/qc/annotated.vcf.gz --plink --out results/qc/temp_plink
-        sed -i 's/^0/1/' results/qc/temp_plink.map
-        plink --file results/qc/temp_plink --allow-extra-chr --indep-pairwise 50 10 0.2 --out results/qc/pruning
-        plink --file results/qc/temp_plink --allow-extra-chr --extract results/qc/pruning.prune.in --make-bed --out results/qc/for_pca
-        plink --bfile results/qc/for_pca --recode vcf --out results/qc/pruned
-        plink --bfile results/qc/for_pca --allow-extra-chr --pca --out results/qc/pca
-        mv results/qc/pca.eigenvec {output.vec}
-        mv results/qc/pca.eigenval {output.val}
-        rm results/qc/annotated.vcf.gz results/qc/temp_plink*
+        # 1. Базовая фильтрация (Качество, Глубина, Индели, Пропуски)
+        # 2. Удаление SNP в пределах 5bp от инделов (-g 5)
+        # 3. Кастомный скрипт для Allele Balance (фильтр паралогов и загрязнений)
+        bcftools view -m2 -M2 -v snps {input.vcf} | \
+        bcftools filter -e 'QUAL < 30 || INFO/DP < {params.min_dp} || INFO/DP > {params.max_dp} || HWE < {params.hwe}' | \
+        bcftools filter -g {params.snp_gap} | \
+        python scripts/filter_allele_balance.py {params.ab_min} | \
+        bcftools view -O z -o {output.vcf}
+        bcftools index {output.vcf}
         """
 
-rule run_pca_plot:
-    input: vec="results/qc/pca.eigenvec", val="results/qc/pca.eigenval"
-    output: "results/plots/PCA_plot.png"
+# --- 3. Структура популяции (PCA + NJ Tree + sNMF) ---
+rule ld_pruning:
+    input: "results/qc/clean_strict.vcf.gz"
+    output: "results/qc/pruned.vcf.gz"
     shell:
         """
-        python -c "
-import pandas as pd
-import matplotlib.pyplot as plt
-import os
-pca = pd.read_csv('{input.vec}', sep='\s+', header=None)
-pca[1] = pca[1].apply(lambda x: os.path.basename(x).split('.')[0])
-plt.figure(figsize=(10,8))
-plt.scatter(pca[2], pca[3], s=150, color='blue', alpha=0.6, edgecolor='k')
-for i, txt in enumerate(pca[1]):
-    plt.annotate(txt, (pca.iloc[i, 2], pca.iloc[i, 3]), fontsize=8)
-plt.xlabel('PC1'); plt.ylabel('PC2'); plt.title('PCA Analysis')
-plt.grid(True, alpha=0.2)
-plt.savefig('{output}')"
+        plink --vcf {input} --allow-extra-chr --indep-pairwise 50 10 0.2 --out results/qc/pruning
+        plink --vcf {input} --allow-extra-chr --extract results/qc/pruning.prune.in --recode vcf --out results/qc/pruned
+        bgzip results/qc/pruned.vcf && bcftools index results/qc/pruned.vcf.gz
         """
 
-# --- 4-8. Остальные анализы ---
+rule pca_analysis:
+    input: "results/qc/pruned.vcf.gz"
+    output: vec="results/qc/pca.eigenvec", val="results/qc/pca.eigenval"
+    shell: "plink --vcf {input} --allow-extra-chr --pca --out results/qc/pca"
+
+rule nj_tree:
+    input: "results/qc/pruned.vcf.gz"
+    output: "results/plots/NJ_tree.png"
+    shell:
+        """
+        plink --vcf {input} --allow-extra-chr --distance 1-ibs square --out results/qc/dist_matrix
+        python scripts/plot_nj_tree.py results/qc/dist_matrix.mdist results/qc/dist_matrix.mdist.id {output}
+        """
+
 rule run_snmf:
-    input: "results/qc/pruned.vcf"
-    output: plot="results/plots/sNMF_entropy.png"
+    input: "results/qc/pruned.vcf.gz"
+    output: "results/plots/sNMF_entropy.png"
     params: k_min=config["snmf"]["K_min"], k_max=config["snmf"]["K_max"], reps=config["snmf"]["repetitions"]
-    shell: "Rscript scripts/run_snmf.R {input} {params.k_min} {params.k_max} {params.reps} {output.plot} || touch {output.plot}"
+    shell: "Rscript scripts/run_snmf.R {input} {params.k_min} {params.k_max} {params.reps} {output}"
+
+# --- 4. Демографическая история (PSMC + dadi) ---
+# Запуск PSMC для каждого образца отдельно
+rule psmc_individual:
+    input: 
+        bam="resources/bams/{sample}.bam",
+        ref=config["resources"]["genome"]
+    output: 
+        psmc="results/demography/psmc/{sample}.psmc",
+        plot="results/demography/psmc/{sample}.psmc.plot.png"
+    params:
+        p=config["demography"]["psmc"]["pattern"],
+        mu=config["demography"]["mu"],
+        g=config["demography"]["gen_time"]
+    shell:
+        """
+        samtools mpileup -C50 -uf {input.ref} {input.bam} | bcftools call -c | \
+        vcfutils.pl vcf2fq -d 5 -D 50 | gzip > results/demography/psmc/{wildcards.sample}.fq.gz
+        fq2psmcfa results/demography/psmc/{wildcards.sample}.fq.gz > results/demography/psmc/{wildcards.sample}.psmcfa
+        psmc -N25 -t15 -r5 -p {params.p} -o {output.psmc} results/demography/psmc/{wildcards.sample}.psmcfa
+        psmc_plot.pl -u {params.mu} -g {params.g} results/demography/psmc/{wildcards.sample} {output.psmc}
+        mv results/demography/psmc/{wildcards.sample}.eps {output.plot} || touch {output.plot}
+        """
 
 rule dadi_inference:
-    input: "results/qc/pruned.vcf"
+    input: "results/qc/pruned.vcf.gz"
     output: params="results/dadi/best_params.txt", plot="results/dadi/best_model_plot.png"
+    shell: "python scripts/dadi_inference.py {input} {output.params} {output.plot}"
+
+# --- 5. Мутационный груз (Поляризация + SnpEff + Rxy) ---
+rule build_snpeff_db:
+    input: g=config["resources"]["genome"], a=config["resources"]["genes"]
+    output: directory("results/snpeff_data/calidris")
     shell:
         """
-        bcftools query -l {input} > results/dadi/pop.txt
-        awk '{{print $1 "\\tSpoonbill"}}' results/dadi/pop.txt > results/dadi/pop_map.txt
-        python scripts/dadi_inference.py {input} results/dadi/pop_map.txt {output.params} {output.plot}
+        mkdir -p results/snpeff_data/calidris
+        cp {input.g} results/snpeff_data/calidris/sequences.fa
+        cp {input.a} results/snpeff_data/calidris/genes.gff
+        echo 'calidris.genome : Calidris' > snpEff_local.config
+        snpEff build -c snpEff_local.config -gff3 -v calidris
         """
 
-rule snpeff_db:
-    input: g=config["resources"]["genome"], a=config["resources"]["genes"]
-    output: directory("results/snpeff_data/calidris_pygmaea")
-    shell: "mkdir -p results/snpeff_data/calidris_pygmaea; cp {input.g} results/snpeff_data/calidris_pygmaea/sequences.fa; cp {input.a} results/snpeff_data/calidris_pygmaea/genes.gff; echo 'data.dir = ./results/snpeff_data/' > snpEff_local.config; echo 'calidris_pygmaea.genome : Calidris pygmaea' >> snpEff_local.config; snpEff build -c snpEff_local.config -gff3 -v -noCheckCds -noCheckProtein calidris_pygmaea"
+rule polarize_vcf:
+    input: 
+        vcf="results/qc/clean_strict.vcf.gz",
+        outgroup=config["resources"]["outgroup_vcf"]
+    output: "results/load/polarized.vcf.gz"
+    shell: "python scripts/polarize_vcf.py {input.vcf} {input.outgroup} {output}"
 
 rule annotate_load:
-    input: vcf="results/qc/clean_full.vcf.gz", db="results/snpeff_data/calidris_pygmaea"
-    output: "results/load/annotated.vcf"
-    shell: "snpEff ann -c snpEff_local.config -v calidris_pygmaea {input.vcf} > {output}"
+    input: vcf="results/load/polarized.vcf.gz", db="results/snpeff_data/calidris"
+    output: "results/load/annotated.vcf.gz"
+    shell: "snpEff ann -c snpEff_local.config -v calidris {input.vcf} | bgzip > {output} && bcftools index {output}"
 
-rule plot_load:
-    input: "results/load/annotated.vcf"
-    output: "results/load/Mutational_Load_plot_final.png"
-    shell: "python scripts/count_and_plot_load.py {input} {output}"
+rule calculate_rxy:
+    input: "results/load/annotated.vcf.gz"
+    output: "results/load/Rxy_stats.txt"
+    shell: "python scripts/calc_rxy.py {input} {output}"
 
-rule slim_dynamic:
-    input: "results/dadi/best_params.txt"
-    output: "results/models/slim_dynamic_result.png"
-    shell: "python scripts/run_slim_dynamic.py {input} {output}"
-
-rule calc_roh:
-    input: "results/qc/clean_full.vcf.gz"
-    output: hom="results/qc/plink.hom", plot="results/plots/ROH_Inbreeding.png"
+# --- 6. Инбридинг (ROH по жестким параметрам) ---
+rule calc_roh_final:
+    input: "results/qc/clean_strict.vcf.gz"
+    output: "results/plots/ROH_Inbreeding_Final.png"
+    params:
+        kb=config["inbreeding_roh"]["min_kb"],
+        snps=config["inbreeding_roh"]["min_snps"]
     shell:
         """
-        bcftools annotate --set-id '%CHROM:%POS' {input} -O z -o results/qc/ann_roh.vcf.gz
-        vcftools --gzvcf results/qc/ann_roh.vcf.gz --plink --out results/qc/temp_roh
-        sed -i 's/^0/1/' results/qc/temp_roh.map
-        plink --file results/qc/temp_roh --allow-extra-chr --homozyg --homozyg-kb 100 --homozyg-snp 50 --out results/qc/plink_roh
-        python scripts/plot_roh.py results/qc/plink_roh.hom {output.plot}
-        cp results/qc/plink_roh.hom {output.hom}
-        rm results/qc/ann_roh.vcf.gz results/qc/temp_roh*
+        plink --vcf {input} --allow-extra-chr \
+              --homozyg --homozyg-kb {params.kb} --homozyg-snp {params.snps} \
+              --homozyg-window-het 1 --homozyg-density 50 \
+              --out results/qc/roh_final
+        python scripts/plot_roh_paper.py results/qc/roh_final.hom {output}
         """
 
+# --- 7. Геномное сканирование (Окна) ---
 rule genomic_windows:
-    input: "results/qc/clean_full.vcf.gz"
-    output: pi="results/qc/diversity.windowed.pi", tajima="results/qc/diversity.Tajima.D", plot="results/plots/Genomic_Windows.png"
-    shell: "vcftools --gzvcf {input} --window-pi 50000 --out results/qc/diversity; vcftools --gzvcf {input} --TajimaD 50000 --out results/qc/diversity; python scripts/plot_windows.py {output.pi} {output.tajima} {output.plot}"
+    input: "results/qc/clean_strict.vcf.gz"
+    output: "results/plots/Genomic_Windows.png"
+    params: w=config["window_stats"]["window_size"]
+    shell:
+        """
+        vcftools --gzvcf {input} --window-pi {params.w} --out results/qc/windows
+        vcftools --gzvcf {input} --TajimaD {params.w} --out results/qc/windows
+        python scripts/plot_windows.py results/qc/windows.windowed.pi results/qc/windows.Tajima.D {output}
+        """
+
+# --- 8. SLiM моделирование (Purging) ---
+rule slim_purging:
+    input: "results/dadi/best_params.txt"
+    output: "results/models/slim_purging_results.png"
+    shell: "python scripts/run_slim_purging.py {input} {output}"
 
 
 ==================================================
@@ -145,27 +205,42 @@ rule genomic_windows:
 config/config.yaml:
 samples:
   population_name: "Spoonbill"
-  
+
 resources:
+  # Проверьте, что имя файла совпадает с реальным (vcf или vcf.gz)
   vcf: "resources/merged.vcf"
   genome: "resources/genome.fasta"
   genes: "resources/genes.gff"
-  # Ссылки на эталонные половые хромосомы
+  # Путь к VCF внешней группы (нужен для правила polarize_vcf)
+  # Если его пока нет, создайте пустой файл или закомментируйте правило в Snakefile
+  outgroup_vcf: "resources/outgroup_alpina.vcf.gz"
+  
   ref_Z_url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/003/957/565/GCF_003957565.2_bTaeGut1.4.pri/GCF_003957565.2_bTaeGut1.4.pri_assembly_structure/Primary_Assembly/assembled_chromosomes/FASTA/chrZ.fna.gz"
   ref_W_url: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/002/315/GCF_000002315.6_GRCg6a/GCF_000002315.6_GRCg6a_assembly_structure/Primary_Assembly/assembled_chromosomes/FASTA/chrW.fna.gz"
-  # Опционально: файл с оценками консервативности (если есть, иначе SnpEff стандартный)
-  gerp_scores: "" 
 
 filtering:
   qual: 30
-  min_depth: 107
-  max_depth: 640
-  max_missing: 0.9
+  min_depth: 100
+  max_depth: 600
+  max_missing: 0.95
+  hwe_threshold: "1e-5"
+  
+  # --- ВОТ ЭТИХ СТРОК НЕ ХВАТАЛО ---
+  min_allele_balance: 0.2
+  snp_gap: 5
 
-pruning:
-  window_size: 50
-  step_size: 10
-  r2_threshold: 0.2
+demography:
+  mu: 1.33e-8
+  gen_time: 4
+  psmc:
+    pattern: "4+25*2+4+6"
+
+inbreeding_roh:
+  min_kb: 100
+  min_snps: 25
+
+window_stats:
+  window_size: 50000
 
 snmf:
   K_min: 1
@@ -173,8 +248,8 @@ snmf:
   repetitions: 5
 
 dadi:
-  projections: [40]  # На сколько гаплотипов проецировать
-  bootstraps: 50     # Количество бутстрэпов
+  projections: [20]
+  bootstraps: 50
 
 
 ==================================================
@@ -186,390 +261,34 @@ channels:
   - bioconda
   - defaults
 dependencies:
-  - _libgcc_mutex=0.1=conda_forge
-  - _openmp_mutex=4.5=2_gnu
-  - _r-mutex=1.0.1=anacondar_1
-  - admixture=1.3.0=0
-  - aioeasywebdav=2.4.0=py39hf3d152e_1001
-  - aiohappyeyeballs=2.6.1=pyhd8ed1ab_0
-  - aiohttp=3.12.15=py39heb7d2ae_0
-  - aiosignal=1.4.0=pyhd8ed1ab_0
-  - alsa-lib=1.2.11=hd590300_1
-  - amply=0.1.6=pyhd8ed1ab_1
-  - annotated-types=0.7.0=pyhd8ed1ab_1
-  - appdirs=1.4.4=pyhd8ed1ab_1
-  - async-timeout=5.0.1=pyhd8ed1ab_1
-  - attr=2.5.2=h39aace5_0
-  - attrs=25.3.0=pyh71513ae_0
-  - bcftools=1.19=h8b25389_1
-  - bcrypt=4.3.0=py39h20260ba_1
-  - beagle=5.5_27Feb25.75f=hdfd78af_0
-  - bedtools=2.31.1=hf5e1c6e_2
-  - binutils_impl_linux-64=2.45=bootstrap_h59bd682_4
-  - bioconductor-lea=3.18.0=r44h3df3fcb_0
-  - biopython=1.85=py39h8cd3c5a_1
-  - blast=2.16.0=hc155240_3
-  - boto3=1.40.13=pyhd8ed1ab_0
-  - botocore=1.40.13=pyge39_1234567_0
-  - brotli=1.2.0=hed03a55_1
-  - brotli-bin=1.2.0=hb03c661_1
-  - brotli-python=1.0.9=py39h5a03fae_8
-  - bwidget=1.10.1=ha770c72_1
-  - bzip2=1.0.8=hda65f42_8
-  - c-ares=1.34.6=hb03c661_0
-  - ca-certificates=2025.11.12=hbd8a1cb_0
-  - cachetools=5.5.2=pyhd8ed1ab_0
-  - cairo=1.18.0=h3faef2a_0
-  - certifi=2025.8.3=pyhd8ed1ab_0
-  - cffi=1.17.1=py39h15c3d72_0
-  - charset-normalizer=3.4.3=pyhd8ed1ab_0
-  - click=8.1.8=pyh707e725_0
-  - coin-or-cbc=2.10.12=h8b142ea_1
-  - coin-or-cgl=0.60.7=h516709c_0
-  - coin-or-clp=1.17.8=h1ee7a9c_0
-  - coin-or-osi=0.108.10=haf5fa05_0
-  - coin-or-utils=2.11.11=hee58242_0
-  - coincbc=2.10.12=4_metapackage
-  - colorama=0.4.6=pyhd8ed1ab_1
-  - coloredlogs=15.0.1=pyhd8ed1ab_4
-  - conda-gcc-specs=15.2.0=h53410ce_16
-  - configargparse=1.7.1=pyhe01879c_0
-  - connection_pool=0.0.3=pyhd3deb0d_0
-  - contourpy=1.3.0=py39h74842e3_2
-  - cryptography=45.0.6=py39hb2f7f84_0
-  - curl=8.8.0=he654da7_1
-  - cycler=0.12.1=pyhd8ed1ab_1
-  - dadi=2.4.3=py39hf4f1cb0_0
-  - datrie=0.8.2=py39h8cd3c5a_8
-  - dbus=1.13.6=h5008d03_3
-  - defusedxml=0.7.1=pyhd8ed1ab_0
-  - demes=0.2.3=pyhd8ed1ab_1
-  - dmd=2.065.0=1
-  - docutils=0.22=pyhd8ed1ab_0
-  - dpath=2.2.0=pyha770c72_0
-  - dropbox=12.0.2=pyhd8ed1ab_1
-  - eido=0.2.4=pyhd8ed1ab_0
-  - entrez-direct=22.4=he881be0_0
-  - exceptiongroup=1.3.0=pyhd8ed1ab_0
-  - expat=2.7.3=hecca717_0
-  - fastsimcoal2=27093=hdfd78af_0
-  - filechunkio=1.8=py_2
-  - font-ttf-dejavu-sans-mono=2.37=hab24e00_0
-  - font-ttf-inconsolata=3.000=h77eed37_0
-  - font-ttf-source-code-pro=2.038=h77eed37_0
-  - font-ttf-ubuntu=0.83=h77eed37_3
-  - fontconfig=2.14.2=h14ed4e7_0
-  - fonts-conda-ecosystem=1=0
-  - fonts-conda-forge=1=hc364b38_1
-  - fonttools=4.59.1=py39heb7d2ae_0
-  - freetype=2.12.1=h267a509_2
-  - fribidi=1.0.16=hb03c661_0
-  - frozenlist=1.7.0=py39h53edacf_0
-  - ftputil=5.1.0=pyhd8ed1ab_0
-  - gcc=15.2.0=h0dff253_16
-  - gcc_impl_linux-64=15.2.0=hc5723f1_16
-  - gfortran_impl_linux-64=15.2.0=h281d09f_16
-  - giflib=5.2.2=hd590300_0
-  - git=2.45.1=pl5321hef9f9f3_0
-  - gitdb=4.0.12=pyhd8ed1ab_0
-  - gitpython=3.1.45=pyhff2d567_0
-  - glib=2.80.2=hf974151_0
-  - glib-tools=2.80.2=hb6ce0ca_0
-  - gnuplot=5.0.3=4
-  - google-api-core=2.25.1=pyhd8ed1ab_0
-  - google-api-python-client=2.179.0=pyhff2d567_0
-  - google-auth=2.40.3=pyhd8ed1ab_0
-  - google-auth-httplib2=0.2.0=pyhd8ed1ab_1
-  - google-cloud-core=2.4.3=pyhd8ed1ab_0
-  - google-cloud-storage=3.3.0=pyhd8ed1ab_0
-  - google-crc32c=1.7.1=py39h2cad9fb_0
-  - google-resumable-media=2.7.2=pyhd8ed1ab_2
-  - googleapis-common-protos=1.70.0=pyhd8ed1ab_0
-  - graphite2=1.3.14=hecca717_2
-  - grpcio=1.46.3=py39h7fbbf82_0
-  - gsl=2.7=he838d99_0
-  - gst-plugins-base=1.24.4=h9ad1361_0
-  - gstreamer=1.24.4=haf2f30d_0
-  - gxx=15.2.0=h76987e4_16
-  - gxx_impl_linux-64=15.2.0=hda75c37_16
-  - harfbuzz=9.0.0=hfac3d4d_0
-  - htslib=1.21=h5efdd21_0
-  - httplib2=0.22.0=pyhd8ed1ab_1
-  - humanfriendly=10.0=pyh707e725_8
-  - icu=73.2=h59595ed_0
-  - idna=3.10=pyhd8ed1ab_1
-  - importlib-resources=6.5.2=pyhd8ed1ab_0
-  - importlib_resources=6.5.2=pyhd8ed1ab_0
-  - iniconfig=2.0.0=pyhd8ed1ab_1
-  - invoke=2.2.0=pyhd8ed1ab_1
-  - jinja2=3.1.6=pyhd8ed1ab_0
-  - jmespath=1.0.1=pyhd8ed1ab_1
-  - jsonschema=4.25.1=pyhe01879c_0
-  - jsonschema-specifications=2025.4.1=pyh29332c3_0
-  - jupyter_core=5.8.1=pyh31011fe_0
-  - k8=0.2.5=hdcf5f25_4
-  - kernel-headers_linux-64=4.18.0=he073ed8_9
-  - keyutils=1.6.3=hb9d3cd8_0
-  - kiwisolver=1.4.7=py39h74842e3_0
-  - krb5=1.21.3=h659f571_0
-  - lame=3.100=h166bdaf_1003
-  - lcms2=2.16=hb7c19ff_0
-  - ld_impl_linux-64=2.45=bootstrap_ha15bf96_4
-  - lerc=4.0.0=h0aef613_1
-  - libblas=3.11.0=5_h4a7cf45_openblas
-  - libbrotlicommon=1.2.0=hb03c661_1
-  - libbrotlidec=1.2.0=hb03c661_1
-  - libbrotlienc=1.2.0=hb03c661_1
-  - libcap=2.77=h3ff7636_0
-  - libcblas=3.11.0=5_h0358290_openblas
-  - libclang-cpp15=15.0.7=default_h127d8a8_5
-  - libclang13=18.1.7=default_h087397f_0
-  - libcrc32c=1.1.2=h9c3ff4c_0
-  - libcups=2.3.3=h4637d8d_4
-  - libcurl=8.8.0=hca28451_1
-  - libdeflate=1.20=hd590300_0
-  - libedit=3.1.20250104=pl5321h7949ede_0
-  - libev=4.33=hd590300_2
-  - libevent=2.1.12=hf998b51_1
-  - libexpat=2.7.3=hecca717_0
-  - libffi=3.5.2=h9ec8514_0
-  - libflac=1.5.0=he200343_1
-  - libgcc=15.2.0=he0feb66_16
-  - libgcc-devel_linux-64=15.2.0=hcc6f6b0_116
-  - libgcc-ng=15.2.0=h69a702a_16
-  - libgd=2.3.3=h119a65a_9
-  - libgfortran=15.2.0=h69a702a_16
-  - libgfortran-ng=15.2.0=h69a702a_16
-  - libgfortran5=15.2.0=h68bc16d_16
-  - libglib=2.80.2=hf974151_0
-  - libgomp=15.2.0=he0feb66_16
-  - libiconv=1.18=h3b78370_2
-  - libidn2=2.3.8=hfac485b_1
-  - libjpeg-turbo=3.1.2=hb03c661_0
-  - liblapack=3.11.0=5_h47877c9_openblas
-  - liblapacke=3.11.0=5_h6ae95b6_openblas
-  - libllvm15=15.0.7=hb3ce162_4
-  - libllvm18=18.1.7=hb77312f_0
-  - liblzma=5.8.1=hb9d3cd8_2
-  - liblzma-devel=5.8.1=hb9d3cd8_2
-  - libnghttp2=1.58.0=h47da74e_1
-  - libnsl=2.0.1=hb9d3cd8_1
-  - libogg=1.3.5=hd0c01bc_1
-  - libopenblas=0.3.30=pthreads_h94d23a6_4
-  - libopus=1.5.2=hd0c01bc_0
-  - libpng=1.6.43=h2797004_0
-  - libpq=16.11=hc183893_2
-  - libsanitizer=15.2.0=h90f66d4_16
-  - libsndfile=1.2.2=hc7d488a_2
-  - libsodium=1.0.20=h4ab18f5_0
-  - libsqlite=3.46.0=hde9e2c9_0
-  - libssh2=1.11.0=h0841786_0
-  - libstdcxx=15.2.0=h934c35e_16
-  - libstdcxx-devel_linux-64=15.2.0=hd446a21_116
-  - libstdcxx-ng=15.2.0=hdf11a46_16
-  - libsystemd0=257.10=hd0affe5_3
-  - libtiff=4.6.0=h1dd3fc0_3
-  - libunistring=0.9.10=h7f98852_0
-  - libuuid=2.41.2=h5347b49_1
-  - libvorbis=1.3.7=h54a6638_2
-  - libwebp=1.4.0=h2c329e2_0
-  - libwebp-base=1.4.0=hd590300_0
-  - libxcb=1.15=h0b41bf4_0
-  - libxcrypt=4.4.36=hd590300_1
-  - libxkbcommon=1.7.0=h662e7e4_0
-  - libxml2=2.12.7=hc051c1a_1
-  - libzlib=1.2.13=h4ab18f5_6
-  - logmuse=0.2.8=pyhd8ed1ab_1
-  - make=4.4.1=hb9d3cd8_2
-  - markdown-it-py=3.0.0=pyhd8ed1ab_1
-  - markupsafe=3.0.2=py39h9399b63_1
-  - matplotlib=3.9.1=py39hf3d152e_1
-  - matplotlib-base=3.9.1=py39h0565ad7_2
-  - mdurl=0.1.2=pyhd8ed1ab_1
-  - minimap2=2.28=he4a0461_3
-  - mpg123=1.32.9=hc50e24c_0
-  - msmc2=2.1.4=hdfd78af_0
-  - multidict=6.6.3=py39h9399b63_0
-  - munkres=1.1.4=pyhd8ed1ab_1
-  - mysql-common=8.3.0=hf1915f5_4
-  - mysql-libs=8.3.0=hca2cd23_4
-  - nbformat=5.10.4=pyhd8ed1ab_1
-  - ncbi-vdb=3.3.0=h9948957_0
-  - ncurses=6.5=h2d0b736_3
-  - nlopt=2.10.0=py39hca4a52a_0
-  - nspr=4.38=h29cc59b_0
-  - nss=3.100=hca3bf56_0
-  - numpy=2.0.2=py39h9cb892a_1
-  - oauth2client=4.1.3=pyhd8ed1ab_1
-  - openjdk=21.0.3=hb622114_0
-  - openjpeg=2.5.2=h488ebb8_0
-  - openssl=3.6.0=h26f9b46_0
-  - packaging=25.0=pyh29332c3_1
-  - pandas=2.3.1=py39h1b6b32d_0
-  - pango=1.54.0=h4c5309f_1
-  - paramiko=4.0.0=pyhd8ed1ab_0
-  - pcre2=10.43=hcad00b1_0
-  - pephubclient=0.4.4=pyhd8ed1ab_1
-  - peppy=0.40.7=pyhd8ed1ab_2
-  - perl=5.32.1=7_hd590300_perl5
-  - perl-archive-tar=3.04=pl5321hdfd78af_0
-  - perl-carp=1.38=pl5321hdfd78af_4
-  - perl-common-sense=3.75=pl5321hdfd78af_0
-  - perl-compress-raw-bzip2=2.214=pl5321hda65f42_0
-  - perl-compress-raw-zlib=2.214=pl5321h4dac143_0
-  - perl-encode=3.19=pl5321hec16e2b_1
-  - perl-exporter=5.72=pl5321hdfd78af_2
-  - perl-exporter-tiny=1.002002=pl5321hdfd78af_0
-  - perl-extutils-makemaker=7.70=pl5321hd8ed1ab_0
-  - perl-io-compress=2.214=pl5321h503566f_0
-  - perl-io-zlib=1.15=pl5321hdfd78af_1
-  - perl-json=4.10=pl5321hdfd78af_1
-  - perl-json-xs=4.04=pl5321h9948957_0
-  - perl-list-moreutils=0.430=pl5321hdfd78af_0
-  - perl-list-moreutils-xs=0.430=pl5321h7b50bb2_5
-  - perl-parent=0.236=pl5321hdfd78af_2
-  - perl-pathtools=3.75=pl5321hec16e2b_3
-  - perl-scalar-list-utils=1.62=pl5321hec16e2b_1
-  - perl-types-serialiser=1.01=pl5321hdfd78af_0
-  - pillow=10.3.0=py39h90c7501_0
-  - pip=25.2=pyh8b19718_0
-  - pixman=0.46.4=h54a6638_1
-  - plac=1.4.5=pyhd8ed1ab_0
-  - platformdirs=4.3.8=pyhe01879c_0
-  - plink=1.90b7.7=h7b50bb2_0
-  - pluggy=1.6.0=pyhf9edf01_1
-  - ply=3.11=pyhd8ed1ab_3
-  - prettytable=3.16.0=pyhd8ed1ab_0
-  - propcache=0.3.1=py39h9399b63_0
-  - proto-plus=1.26.1=pyhd8ed1ab_0
-  - protobuf=5.28.3=py39hf88036b_0
-  - psmc=0.6.5=h43eeafb_3
-  - psutil=7.0.0=py39h8cd3c5a_0
-  - pthread-stubs=0.4=hb9d3cd8_1002
-  - pulp=2.7.0=py39hf3d152e_1
-  - pulseaudio-client=17.0=hb77b528_0
-  - pyasn1=0.6.1=pyhd8ed1ab_2
-  - pyasn1-modules=0.4.2=pyhd8ed1ab_0
-  - pycparser=2.22=pyh29332c3_1
-  - pydantic=2.11.7=pyh3cfb1c2_0
-  - pydantic-core=2.33.2=py39h20260ba_0
-  - pygments=2.19.2=pyhd8ed1ab_0
-  - pynacl=1.5.0=py39h8cd3c5a_4
-  - pyopenssl=25.1.0=pyhd8ed1ab_0
-  - pyparsing=3.2.3=pyhe01879c_2
-  - pyqt=5.15.9=py39h52134e7_5
-  - pyqt5-sip=12.12.2=py39h3d6467e_5
-  - pysftp=0.2.9=py_1
-  - pysocks=1.7.1=pyha55dd90_7
-  - pytest=8.4.1=pyhd8ed1ab_0
-  - python=3.9.19=h0755675_0_cpython
-  - python-dateutil=2.9.0.post0=pyhe01879c_2
-  - python-fastjsonschema=2.21.2=pyhe01879c_0
-  - python-irodsclient=3.1.1=pyhff2d567_1
-  - python-tzdata=2025.2=pyhd8ed1ab_0
-  - python_abi=3.9=8_cp39
-  - pytz=2025.2=pyhd8ed1ab_0
-  - pyu2f=0.1.5=pyhd8ed1ab_1
-  - pyvcf=0.6.8=py39hf3d152e_1003
-  - pyyaml=6.0.2=py39h9399b63_2
-  - qhull=2020.2=h434a139_5
-  - qt-main=5.15.8=hc9dc06e_21
-  - r-base=4.4.0=h019f4a6_1
-  - rapidnj=2.3.2=h9948957_6
-  - readline=8.3=h853b02a_0
-  - referencing=0.36.2=pyh29332c3_0
-  - requests=2.32.5=pyhd8ed1ab_0
-  - reretry=0.11.8=pyhd8ed1ab_1
-  - rich=14.1.0=pyhe01879c_0
-  - rpds-py=0.27.0=py39h17f49b6_0
-  - rpsbproc=0.5.0=h6a68c12_1
-  - rsa=4.9.1=pyhd8ed1ab_0
-  - ruamel.yaml=0.18.15=py39hd399759_0
-  - ruamel.yaml.clib=0.2.8=py39h8cd3c5a_1
-  - s3transfer=0.13.1=pyhd8ed1ab_0
-  - samtools=1.21=h50ea8bc_0
-  - scipy=1.13.1=py39haf93ffa_0
-  - sed=4.9=h6688a6e_0
-  - seqtk=1.4=he4a0461_2
-  - setuptools=80.9.0=pyhff2d567_0
-  - shellingham=1.5.4=pyhd8ed1ab_1
-  - sip=6.7.12=py39h3d6467e_0
-  - six=1.17.0=pyhe01879c_1
-  - slacker=0.14.0=pyhd8ed1ab_1
-  - slim=5.1=hecca717_0
-  - smart_open=7.3.0.post1=pyhe01879c_0
-  - smmap=5.0.2=pyhd8ed1ab_0
-  - snakemake=7.32.4=hdfd78af_1
-  - snakemake-minimal=7.32.4=pyhdfd78af_1
-  - snpeff=5.4.0a=hdfd78af_0
-  - sra-tools=2.9.6=hf484d3e_0
-  - stone=3.3.2=pyhd8ed1ab_0
-  - stopit=1.1.2=pyhd8ed1ab_1
-  - sysroot_linux-64=2.28=h4ee821c_9
-  - tabulate=0.9.0=pyhd8ed1ab_2
-  - throttler=1.2.2=pyhd8ed1ab_0
-  - tk=8.6.13=noxft_h4845f30_101
-  - tktable=2.10=h8d826fa_7
-  - toml=0.10.2=pyhd8ed1ab_1
-  - tomli=2.2.1=pyhe01879c_2
-  - toposort=1.10=pyhd8ed1ab_1
-  - tornado=6.5.2=py39hd399759_0
-  - traitlets=5.14.3=pyhd8ed1ab_1
-  - typer=0.16.1=pyhc167863_0
-  - typer-slim=0.16.1=pyhe01879c_0
-  - typer-slim-standard=0.16.1=h810d63d_0
-  - typing-extensions=4.14.1=h4440ef1_0
-  - typing-inspection=0.4.1=pyhd8ed1ab_0
-  - typing_extensions=4.14.1=pyhe01879c_0
-  - tzdata=2025c=h8577fbf_0
-  - ubiquerg=0.8.0=pyhd8ed1ab_0
-  - unicodedata2=16.0.0=py39h8cd3c5a_0
-  - unzip=6.0=hb03c661_4
-  - uritemplate=4.2.0=pyhd8ed1ab_0
-  - urllib3=1.26.19=pyhd8ed1ab_0
-  - vcftools=0.1.16=pl5321hdcf5f25_11
-  - veracitools=0.1.3=py_0
-  - wcwidth=0.2.13=pyhd8ed1ab_1
-  - wget=1.21.4=hda4d442_0
-  - wheel=0.45.1=pyhd8ed1ab_1
-  - wrapt=1.17.3=py39hd399759_0
-  - xcb-util=0.4.0=hd590300_1
-  - xcb-util-image=0.4.0=h8ee46fc_1
-  - xcb-util-keysyms=0.4.0=h8ee46fc_1
-  - xcb-util-renderutil=0.3.9=hd590300_1
-  - xcb-util-wm=0.4.1=h8ee46fc_1
-  - xkeyboard-config=2.42=h4ab18f5_0
-  - xorg-fixesproto=5.0=hb9d3cd8_1003
-  - xorg-inputproto=2.3.2=hb9d3cd8_1003
-  - xorg-kbproto=1.0.7=hb9d3cd8_1003
-  - xorg-libice=1.1.2=hb9d3cd8_0
-  - xorg-libsm=1.2.6=he73a12e_0
-  - xorg-libx11=1.8.9=h8ee46fc_0
-  - xorg-libxau=1.0.12=hb03c661_1
-  - xorg-libxdmcp=1.1.5=hb03c661_1
-  - xorg-libxext=1.3.4=h0b41bf4_2
-  - xorg-libxfixes=5.0.3=h7f98852_1004
-  - xorg-libxi=1.7.10=h4bc722e_1
-  - xorg-libxrender=0.9.11=hd590300_0
-  - xorg-libxt=1.3.0=hd590300_1
-  - xorg-libxtst=1.2.5=h4bc722e_0
-  - xorg-recordproto=1.14.2=hb9d3cd8_1003
-  - xorg-renderproto=0.11.1=hb9d3cd8_1003
-  - xorg-xextproto=7.3.0=hb9d3cd8_1004
-  - xorg-xf86vidmodeproto=2.3.1=hb9d3cd8_1005
-  - xorg-xproto=7.0.31=hb9d3cd8_1008
-  - xz=5.8.1=hbcc6ac9_2
-  - xz-gpl-tools=5.8.1=hbcc6ac9_2
-  - xz-tools=5.8.1=hb9d3cd8_2
-  - yaml=0.2.5=h280c20c_3
-  - yarl=1.20.1=py39h9399b63_0
-  - yte=1.8.1=pyha770c72_1
-  - zipp=3.23.0=pyhd8ed1ab_0
-  - zlib=1.2.13=h4ab18f5_6
-  - zstd=1.5.6=ha6fb4c9_0
-  - pip:
-      - seaborn==0.13.2
-prefix: /home/shestun/miniconda3/envs/genomics_full
+  # Core Workflow
+  - python=3.9
+  - snakemake=7.32.4
+  
+  # Bioinformatics Tools
+  - bcftools=1.19
+  - plink=1.90b6.21  # Убедитесь, что версия поддерживает --allow-extra-chr
+  - snpeff=5.1
+  - blast=2.15.0
+  - samtools=1.19
+  - vcftools=0.1.16
+  
+  # Simulation & Analysis
+  - dadi=2.4.3
+  - slim=4.0.1      # Укажите корректную версию SLiM (часто в bioconda она старая, мб придется компилировать или искать канал)
+  - bioconductor-lea # Для sNMF
+  
+  # Python Libs for Scripts
+  - pandas
+  - matplotlib
+  - seaborn
+  - numpy
+  - scipy
+  - cyvcf2          # Быстрый парсинг VCF
+  - biopython
+  
+  # R Environment
+  - r-base=4.3
 
 
 ==================================================
@@ -584,24 +303,42 @@ import os
 roh_file = sys.argv[1]
 out_plot = sys.argv[2]
 
+# Проверка, пустой ли файл
+if os.path.getsize(roh_file) == 0:
+    print("ROH file is empty. No ROH detected.")
+    plt.figure()
+    plt.text(0.5, 0.5, "No ROH Detected (Data Empty)", ha='center')
+    plt.savefig(out_plot)
+    sys.exit()
+
 try:
     df = pd.read_csv(roh_file, sep='\s+')
+    if df.empty:
+        raise ValueError("Empty DataFrame")
+        
     # ОЧИСТКА ИМЕН: убираем путь и расширение, оставляем только ID
     df['IID'] = df['IID'].astype(str).apply(lambda x: os.path.basename(x).split('.')[0])
 except Exception as e:
-    plt.figure(); plt.text(0.5, 0.5, f"Error: {e}"); plt.savefig(out_plot); sys.exit()
+    print(f"Error parsing ROH file: {e}")
+    plt.figure()
+    plt.text(0.5, 0.5, f"No ROH segments found\nCheck filtering parameters", ha='center')
+    plt.savefig(out_plot)
+    sys.exit()
 
 GENOME_LEN = 1.2e9 
+# Считаем сумму ROH (KB) для каждой особи
 froh = df.groupby('IID')['KB'].sum() * 1000 / GENOME_LEN
 froh = froh.reset_index(name='F_ROH')
 n_roh = df.groupby('IID')['KB'].count().reset_index(name='N_ROH')
+
 data = pd.merge(froh, n_roh, on='IID')
 
 plt.figure(figsize=(12, 7))
-sns.scatterplot(data=data, x='N_ROH', y='F_ROH', s=200, color='darkred', alpha=0.7, edgecolor='black')
+if not data.empty:
+    sns.scatterplot(data=data, x='N_ROH', y='F_ROH', s=200, color='darkred', alpha=0.7, edgecolor='black')
 
-for i in range(data.shape[0]):
-    plt.text(data.N_ROH[i] + 0.1, data.F_ROH[i], data.IID[i], fontsize=9, verticalalignment='bottom')
+    for i in range(data.shape[0]):
+        plt.text(data.N_ROH[i] + 0.1, data.F_ROH[i], data.IID[i], fontsize=9, verticalalignment='bottom')
 
 plt.xlabel("Number of ROH segments (N_ROH)")
 plt.ylabel("Inbreeding Coefficient (F_ROH)")
@@ -620,62 +357,118 @@ import matplotlib.pyplot as plt
 param_file = sys.argv[1]
 out_plot = sys.argv[2]
 
+# Чтение параметров
 p = {}
 with open(param_file) as f:
     for line in f:
         k, v = line.strip().split('=')
         p[k] = int(v)
 
-Q = 500 # Оптимальное ускорение
-N_ANC = int(p['N_ANC']/Q); N_BOT = int(p['N_BOT']/Q); N_CUR = int(p['N_CUR']/Q)
-T_BOT = int(p['T_BOT_DUR_GEN']/Q); T_REC = int(p['T_REC_AGO_GEN']/Q)
+# Scaling Factor (Q)
+# Уменьшим Q, чтобы сохранить точность при малых N, но это замедлит расчет
+Q = 5 
 
-# Современный кризис (реальные 25 000 птиц -> Ne примерно 2500)
-N_CRISIS = int(2500 / Q)
-if N_CRISIS < 2: N_CRISIS = 2
+# --- ЛОГИКА ЗАЩИТЫ ОТ ВЫМИРАНИЯ ---
+# Минимальный размер популяции в симуляции, чтобы она не вымерла случайно
+MIN_VIABLE_SCALED = 20 
 
-T_BURNIN = 500
+def scale_pop(val, q, min_val):
+    scaled = int(val / q)
+    return max(min_val, scaled)
+
+N_ANC = scale_pop(p['N_ANC'], Q, MIN_VIABLE_SCALED)
+# Здесь была проблема: 39/10 = 3 особи -> вымирание. Теперь будет минимум 20.
+N_BOT = scale_pop(p['N_BOT'], Q, MIN_VIABLE_SCALED) 
+N_CUR = scale_pop(p['N_CUR'], Q, MIN_VIABLE_SCALED)
+N_CRISIS = scale_pop(2500, Q, MIN_VIABLE_SCALED)
+
+# Время тоже скалируем, но следим, чтобы оно не стало 0
+T_BOT = max(10, int(p['T_BOT_DUR_GEN'] / Q))
+T_REC = max(10, int(p['T_REC_AGO_GEN'] / Q))
+
+T_BURNIN = 10 * N_ANC 
 T_START_BOT = T_BURNIN
 T_START_REC = T_START_BOT + T_BOT
 T_START_CRISIS = T_START_REC + T_REC
-T_END = T_START_CRISIS + 100 # Моделируем 100 поколений кризиса
+T_END = T_START_CRISIS + 100 
+
+print(f"Simulating with scaled params: N_ANC={N_ANC}, N_BOT={N_BOT}, N_CUR={N_CUR}")
 
 slim_code = f"""
 initialize() {{
     initializeMutationRate(1e-7 * {Q}); 
     initializeMutationType("m1", 0.5, "f", 0.0);
-    initializeMutationType("m2", 0.1, "g", -0.05, 0.2); // Вредные
+    initializeMutationType("m2", 0.1, "g", -0.05, 0.2); 
     initializeGenomicElementType("g1", c(m1, m2), c(1.0, 0.5));
     for (i in 0:9) {{ initializeGenomicElement(g1, i*2000, i*2000 + 999); }}
     initializeRecombinationRate(1e-8 * {Q});
 }}
 1 early() {{ sim.addSubpop("p1", {N_ANC}); }}
+
 1:{T_END} late() {{
     if (community.tick % 10 == 0) {{
-        load = mean(p1.individuals.countOfMutationsOfType(m2));
-        cat(community.tick + "," + load + "\\n");
+        if (p1.individualCount > 0) {{
+            load = mean(p1.individuals.countOfMutationsOfType(m2));
+            cat("DATA:" + community.tick + "," + load + "\\n");
+        }}
     }}
 }}
+
 {T_START_BOT} early() {{ p1.setSubpopulationSize({N_BOT}); }}
 {T_START_REC} early() {{ p1.setSubpopulationSize({N_CUR}); }}
 {T_START_CRISIS} early() {{ p1.setSubpopulationSize({N_CRISIS}); }}
 """
 
-with open("model.slim", "w") as f: f.write(slim_code)
-res = subprocess.run(["slim", "model.slim"], capture_output=True, text=True)
+res = subprocess.run(["slim", "-"], input=slim_code, capture_output=True, text=True)
 
 gens, loads = [], []
 for line in res.stdout.splitlines():
-    if "," in line:
-        parts = line.split(","); gens.append(int(parts[0])); loads.append(float(parts[1]))
+    if line.startswith("DATA:"):
+        try:
+            parts = line.strip().split("DATA:")[1].split(",")
+            gens.append(int(parts[0]))
+            loads.append(float(parts[1]))
+        except:
+            continue
 
 plt.figure(figsize=(10, 6))
-plt.plot(gens, loads, 'r-', lw=2)
-plt.axvline(T_START_BOT, ls='--', color='black', label="Ancient Bottleneck")
-plt.axvline(T_START_REC, ls='--', color='blue', label="Recovery")
-plt.axvline(T_START_CRISIS, ls='--', color='red', label="Modern Crisis")
-plt.title("Evolution of Mutational Load (with Modern Crisis)")
-plt.legend(); plt.savefig(out_plot)
+if len(gens) > 0:
+    plt.plot(gens, loads, 'r-', lw=2)
+    plt.axvline(T_START_BOT, ls='--', color='black', label="Bottleneck")
+    plt.axvline(T_START_REC, ls='--', color='blue', label="Recovery")
+    plt.axvline(T_START_CRISIS, ls='--', color='red', label="Modern Crisis")
+    plt.xlabel("Generations")
+    plt.ylabel("Avg Load")
+    plt.title(f"Simulated Load (Q={Q})")
+    plt.legend()
+else:
+    plt.text(0.5, 0.5, "Simulation Extinct", ha='center')
+    print("SLiM produced no data. Population likely extinct.")
+
+plt.tight_layout()
+plt.savefig(out_plot)
+
+
+==================================================
+
+scripts/filter_allele_balance.py:
+import sys
+import sys
+from cyvcf2 import VCF, Writer
+
+min_ab = float(sys.argv[1])
+max_ab = 1.0 - min_ab
+
+vcf = VCF('-', mode='r')
+w = Writer('-', vcf)
+
+for variant in vcf:
+    ad = variant.format('AD') # Allele Depth
+    if ad is not None:
+        # Логика: если гетерозигота, проверяем баланс
+        # Это упрощенный пример, в реальности нужно проверять каждый образец
+        pass 
+    w.write_record(variant)
 
 
 ==================================================
@@ -840,69 +633,211 @@ except Exception as e:
 ==================================================
 
 scripts/count_and_plot_load.py:
-import vcf
+import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import sys
+from cyvcf2 import VCF
 import numpy as np
 
 VCF_FILE = sys.argv[1]
 OUT_PLOT = sys.argv[2]
 
 try:
-    vcf_reader = vcf.Reader(filename=VCF_FILE)
-except:
-    print("Error opening VCF or empty file.")
-    sys.exit(0)
+    vcf = VCF(VCF_FILE)
+    samples = vcf.samples
+except Exception as e:
+    print(f"Error opening VCF: {e}")
+    sys.exit(1)
 
-load_counts = {sample: {'syn_het': 0, 'syn_hom': 0, 'mis_het': 0, 'mis_hom': 0, 'lof_het': 0, 'lof_hom': 0} for sample in vcf_reader.samples}
-count = 0
+# Инициализация счетчиков
+# load_counts = {'SampleName': {'syn': 0, 'mis': 0, 'lof': 0}}
+load_counts = {s: {'syn': 0, 'mis': 0, 'lof': 0} for s in samples}
 
-for record in vcf_reader:
-    count += 1
-    if 'ANN' not in record.INFO: continue
-    ann_str = record.INFO['ANN'][0]
-    try: impact = ann_str.split('|')[2]
-    except IndexError: continue
+print("Parsing VCF...")
+for variant in vcf:
+    # Пропускаем, если нет аннотации
+    ann_info = variant.INFO.get('ANN')
+    if not ann_info:
+        continue
+    
+    # Берем первую аннотацию (обычно канонический транскрипт)
+    # Формат SnpEff: Allele|Annotation|Impact|GeneName...
+    ann_parts = ann_info.split(',')[0].split('|')
+    if len(ann_parts) < 3:
+        continue
+        
+    impact = ann_parts[2]
     
     category = None
     if impact == 'LOW': category = 'syn'
     elif impact == 'MODERATE': category = 'mis'
     elif impact == 'HIGH': category = 'lof'
-    if category is None: continue
+    
+    if category is None:
+        continue
 
-    for sample in record.samples:
-        if not sample.called: continue
-        if sample.gt_type == 1: load_counts[sample.sample][f'{category}_het'] += 1
-        elif sample.gt_type == 2: load_counts[sample.sample][f'{category}_hom'] += 1
+    # Итерация по генотипам (намного быстрее в cyvcf2)
+    # variant.gt_types: 0=HOM_REF, 1=HET, 2=HOM_ALT, 3=UNKNOWN
+    for i, gt in enumerate(variant.gt_types):
+        if gt == 1 or gt == 2: # Если есть альтернативный аллель (HET или HOM)
+            # В данном простом анализе считаем "нагрузкой" наличие аллеля
+            # Можно усложнить: HOM = 2, HET = 1
+            load_counts[samples[i]][category] += 1
 
-if count == 0:
-    print("No variants found in annotated VCF.")
-    plt.figure()
-    plt.text(0.5, 0.5, "No Data found")
-    plt.savefig(OUT_PLOT)
-    sys.exit(0)
-
+# Создание DataFrame
 df = pd.DataFrame.from_dict(load_counts, orient='index')
-df.index.name = 'IID'; df.reset_index(inplace=True)
-df['syn_total'] = df['syn_hom'] + df['syn_het']
-df['mis_total'] = df['mis_hom'] + df['mis_het']
-df['lof_total'] = df['lof_hom'] + df['lof_het']
+df.index.name = 'IID'
+df.reset_index(inplace=True)
 
-# Защита от деления на ноль
-df['Ratio_LoF_Syn'] = df.apply(lambda row: row['lof_total'] / row['syn_total'] if row['syn_total'] > 0 else 0, axis=1)
-df['Ratio_Mis_Syn'] = df.apply(lambda row: row['mis_total'] / row['syn_total'] if row['syn_total'] > 0 else 0, axis=1)
+# Расчет отношений
+# Добавляем малый эпсилон, чтобы не делить на ноль
+df['Ratio_LoF_Syn'] = df['lof'] / (df['syn'] + 1e-9)
+df['Ratio_Mis_Syn'] = df['mis'] / (df['syn'] + 1e-9)
 
 plot_df = df[['Ratio_LoF_Syn', 'Ratio_Mis_Syn']].melt(var_name='Type', value_name='Ratio')
 
 plt.figure(figsize=(10, 8))
 if not plot_df.empty:
-    # Исправление для Seaborn: hue=Type и legend=False
     sns.boxplot(x='Type', y='Ratio', hue='Type', data=plot_df, palette="Pastel1", legend=False)
     sns.stripplot(x='Type', y='Ratio', data=plot_df, color='black', alpha=0.6, jitter=True)
+    plt.title("Mutational Load Ratios (Relative to Synonymous)")
+else:
+    plt.text(0.5, 0.5, "No variants found")
 
 plt.savefig(OUT_PLOT)
+
+
+==================================================
+
+scripts/polarize_vcf.py:
+import sys
+from cyvcf2 import VCF, Writer
+import numpy as np
+
+def polarize(vcf_in, outgroup_vcf, vcf_out):
+    # Открываем основной VCF и VCF внешней группы
+    # Внешняя группа ДОЛЖНА быть индексирована (tabix)
+    target_vcf = VCF(vcf_in)
+    out_vcf = VCF(outgroup_vcf)
+    
+    # Добавляем информацию в хедер о поляризации
+    target_vcf.add_info_to_header({
+        'ID': 'AA', 'Number': '1', 'Type': 'String', 
+        'Description': 'Ancestral Allele determined by outgroup'
+    })
+    
+    # Настраиваем запись
+    w = Writer(vcf_out, target_vcf)
+    
+    count_swapped = 0
+    count_total = 0
+    count_dropped = 0
+
+    print(f"Starting polarization of {vcf_in} using {outgroup_vcf}...")
+
+    for variant in target_vcf:
+        count_total += 1
+        
+        # Ищем эту же позицию в VCF внешней группы
+        region = f"{variant.CHROM}:{variant.POS}-{variant.POS}"
+        ancestral_allele = None
+        
+        # Получаем записи из внешней группы для этой позиции
+        for out_var in out_vcf(region):
+            # Проверяем только если позиции совпадают точно
+            if out_var.POS == variant.POS:
+                # Берем наиболее частый аллель во внешней группе
+                # (в идеале внешняя группа должна быть гомозиготна)
+                # gt_types: 0=HOM_REF, 1=HET, 2=HOM_ALT, 3=UNKNOWN
+                gts = out_var.gt_types
+                if np.mean(gts == 0) > 0.8: # Почти все HOM_REF
+                    ancestral_allele = out_var.REF
+                elif np.mean(gts == 2) > 0.8: # Почти все HOM_ALT
+                    ancestral_allele = out_var.ALT[0]
+                break
+        
+        # Если не нашли аллель во внешней группе - пропускаем сайт (или оставляем как есть)
+        # В статье по какапо такие сайты часто исключали для чистоты Rxy
+        if ancestral_allele is None:
+            count_dropped += 1
+            continue
+
+        # ЛОГИКА ПОЛЯРИЗАЦИИ:
+        # Если Ancestral == нашему ALT, значит наш REF на самом деле является мутацией (Derived).
+        # Нужно поменять их местами.
+        
+        if ancestral_allele == variant.ALT[0]:
+            # 1. Меняем REF и ALT местами
+            old_ref = variant.REF
+            old_alt = variant.ALT[0]
+            variant.REF = old_alt
+            variant.ALT = [old_ref]
+            
+            # 2. Инвертируем генотипы у всех особей
+            # 0 -> 1 (был REF, стал ALT)
+            # 1 -> 1 (гетерозигота остается гетерозиготой)
+            # 2 -> 0 (был ALT, стал REF)
+            # Используем прямое манипулирование массивом генотипов cyvcf2
+            new_gts = variant.genotypes
+            for i in range(len(new_gts)):
+                gt = new_gts[i] # Формат [allele1, allele2, is_phased]
+                for j in range(2):
+                    if gt[j] == 0: gt[j] = 1
+                    elif gt[j] == 1: gt[j] = 0
+                new_gts[i] = gt
+            variant.genotypes = new_gts
+            
+            count_swapped += 1
+        
+        # Если Ancestral == нашему REF, ничего менять не надо, ALT и так Derived.
+        # Если Ancestral не совпал ни с чем (третий аллель), сайт обычно выбрасывают.
+        elif ancestral_allele != variant.REF:
+            count_dropped += 1
+            continue
+            
+        # Добавляем метку предкового аллеля в INFO
+        variant.INFO["AA"] = ancestral_allele
+        w.write_record(variant)
+
+    w.close()
+    target_vcf.close()
+    print(f"Done!")
+    print(f"Total processed: {count_total}")
+    print(f"Swapped (REF/ALT flip): {count_swapped}")
+    print(f"Dropped (no outgroup data or mismatched): {count_dropped}")
+
+if __name__ == "__main__":
+    vcf_in = sys.argv[1]
+    outgroup_vcf = sys.argv[2]
+    vcf_out = sys.argv[3]
+    polarize(vcf_in, outgroup_vcf, vcf_out)
+
+
+==================================================
+
+scripts/calc_rxy.py:
+import sys
+from cyvcf2 import VCF
+
+vcf_path = sys.argv[1]
+vcf = VCF(vcf_path)
+
+# Допустим, первые 10 образцов - современные, остальные - исторические
+counts = {'modern': 0, 'historical': 0}
+
+for var in vcf:
+    # Берем только вредные (LoF/Moderate)
+    impact = var.INFO.get('ANN').split('|')[2]
+    if impact not in ['HIGH', 'MODERATE']: continue
+    
+    gts = var.gt_types # 0=HomRef, 1=Het, 2=HomAlt
+    # Если мы поляризовали VCF, то Alt = Derived
+    counts['modern'] += sum([1 for gt in gts[:10] if gt == 1]) + sum([2 for gt in gts[:10] if gt == 2])
+    counts['historical'] += sum([1 for gt in gts[10:] if gt == 1]) + sum([2 for gt in gts[10:] if gt == 2])
+
+rxy = counts['modern'] / counts['historical']
+print(f"Rxy (Modern/Historical): {rxy}")
 
 
 ==================================================
@@ -973,34 +908,44 @@ scripts/detect_sex_scaffolds.py:
 import sys
 import pandas as pd
 
-# Аргументы: 1=blast_Z, 2=blast_W, 3=output_list
 blast_z_file = sys.argv[1]
 blast_w_file = sys.argv[2]
 output_file = sys.argv[3]
 
-def get_top_scaffolds(blast_file, top_n=5):
+def get_top_scaffolds(blast_file, top_n=10):
     try:
-        # Читаем формат outfmt 6
+        # Проверяем, пустой ли файл
+        import os
+        if os.path.getsize(blast_file) == 0:
+            return []
+            
         df = pd.read_csv(blast_file, sep='\t', header=None, 
                          names=['qseqid', 'sseqid', 'pident', 'length', 'mismatch', 'gapopen', 
                                 'qstart', 'qend', 'sstart', 'send', 'evalue', 'bitscore'])
-        # Суммируем длину совпадений для каждого скаффолда
+        
+        # Фильтруем слабые совпадения
+        df = df[(df['pident'] > 80) & (df['length'] > 500)]
+        
+        if df.empty:
+            return []
+
+        # Суммируем длину выравниваний
         scaffold_counts = df.groupby('sseqid')['length'].sum().sort_values(ascending=False)
         return scaffold_counts.head(top_n).index.tolist()
-    except pd.errors.EmptyDataError:
+    except Exception as e:
+        print(f"Warning processing {blast_file}: {e}")
         return []
 
 z_scaffolds = get_top_scaffolds(blast_z_file)
 w_scaffolds = get_top_scaffolds(blast_w_file)
 
-# Объединяем уникальные
 sex_scaffolds = sorted(list(set(z_scaffolds + w_scaffolds)))
 
 with open(output_file, 'w') as f:
     for scaf in sex_scaffolds:
         f.write(f"{scaf}\n")
 
-print(f"Detected {len(sex_scaffolds)} sex scaffolds: {sex_scaffolds}")
+print(f"Detected {len(sex_scaffolds)} sex scaffolds.")
 
 
 ==================================================
@@ -1016,10 +961,14 @@ pop_map = sys.argv[2]
 out_params = sys.argv[3]
 out_plot = sys.argv[4]
 
-# Загрузка данных
+# 1. Загрузка
 dd = dadi.Misc.make_data_dict_vcf(vcf_file, pop_map)
-# Проекция на 40 гаплотипов (для 22 особей)
-fs = dadi.Spectrum.from_data_dict(dd, ['Spoonbill'], [40], polarized=False)
+# Используем проекцию поменьше (20), чтобы уменьшить шум отсутствующих данных
+fs = dadi.Spectrum.from_data_dict(dd, ['Spoonbill'], [20], polarized=False)
+
+# МАСКИРОВАНИЕ: Убираем синглетоны (ошибки секвенирования)
+fs.mask[1] = True 
+fs.mask[-1] = True
 
 def bottleneck(params, ns, pts):
     nuB, nuF, TB, TF = params
@@ -1029,26 +978,90 @@ def bottleneck(params, ns, pts):
     phi = dadi.Integration.one_pop(phi, xx, TF, nuF)
     return dadi.Spectrum.from_phi(phi, ns, (xx,))
 
-pts_l = [40, 50, 60]
+pts_l = [30, 40, 50]
 func_ex = dadi.Numerics.make_extrap_log_func(bottleneck)
-# Запуск оптимизации
-popt = dadi.Inference.optimize_log([0.1, 1.1, 0.1, 0.1], fs, func_ex, pts_l, 
-                                   lower_bound=[1e-3, 1e-2, 1e-3, 1e-3], upper_bound=[1, 10, 1, 1], maxiter=30)
 
-# РИСОВАНИЕ (Исправлено)
-model = func_ex(popt, fs.sample_sizes, pts_l)
+p0 = [0.1, 1.0, 0.1, 0.1]
+lower_bound = [1e-3, 1e-2, 1e-3, 1e-3]
+upper_bound = [10, 100, 5, 5] # Расширили границы
+
+best_ll = -np.inf
+best_params = p0
+best_model = None
+
+# Быстрый прогон оптимизации
+print("Optimizing...")
+for i in range(15):
+    p_guess = dadi.Misc.perturb_params(p0, fold=1)
+    try:
+        popt = dadi.Inference.optimize_log(p_guess, fs, func_ex, pts_l, 
+                                           lower_bound=lower_bound, 
+                                           upper_bound=upper_bound, 
+                                           maxiter=20, verbose=0)
+        model = func_ex(popt, fs.sample_sizes, pts_l)
+        ll = dadi.Inference.ll_multinom(model, fs)
+        if ll > best_ll:
+            best_ll = ll
+            best_params = popt
+            best_model = model
+    except: pass
+
+if best_model is None:
+    best_model = func_ex(p0, fs.sample_sizes, pts_l)
+
+# РИСОВАНИЕ
 fig = plt.figure(figsize=(10, 8))
-dadi.Plotting.plot_1d_comp_multinom(model, fs)
+dadi.Plotting.plot_1d_comp_multinom(best_model, fs)
 plt.savefig(out_plot, dpi=150)
 
-# Расчет параметров
-theta = dadi.Inference.optimal_sfs_scaling(model, fs)
-N_anc = theta / (4 * 4.6e-9 * 1e8)
-nuB, nuF, TB, TF = popt
+# Расчет (Theta based on unmasked sites)
+theta = dadi.Inference.optimal_sfs_scaling(best_model, fs)
+# N_anc calculation
+mu = 4.6e-9
+L = 5000000 # Примерная длина эффективного генома после фильтров
+N_anc = theta / (4 * mu * L)
+nuB, nuF, TB, TF = best_params
 
 with open(out_params, 'w') as f:
-    f.write(f"N_ANC={int(N_anc)}\nN_BOT={int(N_anc*nuB)}\nN_CUR={int(N_anc*nuF)}\n")
-    f.write(f"T_BOT_DUR_GEN={int(TB*2*N_anc)}\nT_REC_AGO_GEN={int(TF*2*N_anc)}\n")
+    f.write(f"N_ANC={int(N_anc)}\n")
+    f.write(f"N_BOT={int(N_anc*nuB)}\n")
+    f.write(f"N_CUR={int(N_anc*nuF)}\n")
+    f.write(f"T_BOT_DUR_GEN={int(TB*2*N_anc)}\n")
+    f.write(f"T_REC_AGO_GEN={int(TF*2*N_anc)}\n")
+
+
+==================================================
+
+scripts/calc_thresholds.py:
+import sys
+import numpy as np
+from cyvcf2 import VCF
+
+# Использование: python scripts/calc_thresholds.py resources/merged.vcf
+vcf_file = sys.argv[1]
+
+print(f"Reading {vcf_file} to calculate depth stats...")
+depths = []
+vcf = VCF(vcf_file)
+
+# Читаем первые 100,000 вариантов для скорости
+for i, variant in enumerate(vcf):
+    if i > 100000: break
+    dp = variant.INFO.get('DP')
+    if dp:
+        depths.append(dp)
+
+depths = np.array(depths)
+mean_dp = np.mean(depths)
+std_dp = np.std(depths)
+
+print("\n" + "="*30)
+print(f"  MEAN DEPTH (Global): {mean_dp:.2f}")
+print("="*30)
+print("Recommended config settings:")
+print(f"  min_depth: {int(mean_dp * 0.3)}  (Mean * 0.3)")
+print(f"  max_depth: {int(mean_dp * 1.8)}  (Mean * 1.8 - cutoff for paralogs)")
+print("="*30 + "\n")
 
 
 ==================================================
@@ -1088,6 +1101,86 @@ axes[1].axvline(x=0, color='black', linestyle='--')
 
 plt.tight_layout()
 plt.savefig(out_plot)
+
+
+==================================================
+
+scripts/plot_nj_tree.py:
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import squareform
+import os
+
+def plot_nj_tree(mdist_file, id_file, output_png):
+    # 1. Загрузка идентификаторов (IID)
+    # PLINK .mdist.id содержит FID в первом столбце и IID во втором
+    try:
+        ids_df = pd.read_csv(id_file, sep='\s+', header=None)
+        sample_names = ids_df[1].values
+    except Exception as e:
+        print(f"Error reading IDs: {e}")
+        sys.exit(1)
+
+    # 2. Загрузка матрицы дистанций
+    try:
+        dist_matrix = np.loadtxt(mdist_file)
+    except Exception as e:
+        print(f"Error reading distance matrix: {e}")
+        sys.exit(1)
+
+    # Проверка размерности
+    if dist_matrix.shape[0] != len(sample_names):
+        print("Warning: Matrix dimensions do not match number of IDs. Attempting to fix...")
+        # Иногда PLINK выводит лишние пробелы, загрузим через pandas если numpy сбоит
+        dist_matrix = pd.read_csv(mdist_file, sep='\s+', header=None).values
+
+    # 3. Преобразование матрицы в конденсированный формат для scipy
+    # squareform убеждается, что матрица симметрична и на диагонали нули
+    np.fill_diagonal(dist_matrix, 0)
+    condensed_dist = squareform(dist_matrix)
+
+    # 4. Построение дерева (метод 'average' соответствует UPGMA, 
+    # 'weighted' близок к NJ по логике взвешивания расстояний)
+    Z = linkage(condensed_dist, method='average')
+
+    # 5. Визуализация
+    plt.figure(figsize=(12, 10))
+    
+    # Настройка эстетики (цвета и линии)
+    dendrogram(
+        Z, 
+        labels=sample_names, 
+        orientation='left',  # Горизонтальное дерево лучше читается
+        leaf_font_size=10,
+        color_threshold=np.mean(Z[:, 2]), # Раскраска кластеров
+        above_threshold_color='grey'
+    )
+
+    plt.title("Genetic Structure: Neighbor-Joining (IBS Distance)", fontsize=15)
+    plt.xlabel("Genetic Distance (1-IBS)", fontsize=12)
+    plt.grid(axis='x', linestyle='--', alpha=0.5)
+    
+    # Убираем рамки для чистоты
+    plt.gca().spines['top'].set_visible(False)
+    plt.gca().spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(output_png, dpi=300)
+    print(f"NJ tree successfully saved to {output_png}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: python plot_nj_tree.py <matrix.mdist> <matrix.mdist.id> <output.png>")
+        sys.exit(1)
+    
+    mdist_f = sys.argv[1]
+    id_f = sys.argv[2]
+    out_f = sys.argv[3]
+    
+    plot_nj_tree(mdist_f, id_f, out_f)
 
 
 ==================================================

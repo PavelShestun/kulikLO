@@ -1,27 +1,20 @@
-# Игнорируем тяжелые данные
+# Игнорируем данные
 resources/
-results/qc/
-results/load/*.vcf
-results/snpeff_data/
-results/demography/
-*.gz
-*.csi
-*.log
+results/
+data/
+*.bam
+*.sam
+*.vcf
+*.vcf.gz
+*.fasta
+*.fna
+*.tbi
+*.bai
+
+# Игнорируем временные файлы Snakemake и логи
 .snakemake/
-
-# Но сохраняем папку с графиками и результатами моделей
-!results/
-!results/plots/
-!results/plots/*.png
-!results/dadi/
-!results/dadi/*.png
-!results/models/
-!results/models/*.png
-
-# Игнорируем временные файлы PLINK
-*.bed
-*.bim
-*.fam
-*.map
-*.ped
-*.nose*
+*.log
+pop_map_real.txt
+snpEff_local.config
+temp_model.slim
+merged.zip

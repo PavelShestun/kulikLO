@@ -1,63 +1,73 @@
-import vcf
+import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import sys
+from cyvcf2 import VCF
 import numpy as np
 
 VCF_FILE = sys.argv[1]
 OUT_PLOT = sys.argv[2]
 
 try:
-    vcf_reader = vcf.Reader(filename=VCF_FILE)
-except:
-    print("Error opening VCF or empty file.")
-    sys.exit(0)
+    vcf = VCF(VCF_FILE)
+    samples = vcf.samples
+except Exception as e:
+    print(f"Error opening VCF: {e}")
+    sys.exit(1)
 
-load_counts = {sample: {'syn_het': 0, 'syn_hom': 0, 'mis_het': 0, 'mis_hom': 0, 'lof_het': 0, 'lof_hom': 0} for sample in vcf_reader.samples}
-count = 0
+# Инициализация счетчиков
+# load_counts = {'SampleName': {'syn': 0, 'mis': 0, 'lof': 0}}
+load_counts = {s: {'syn': 0, 'mis': 0, 'lof': 0} for s in samples}
 
-for record in vcf_reader:
-    count += 1
-    if 'ANN' not in record.INFO: continue
-    ann_str = record.INFO['ANN'][0]
-    try: impact = ann_str.split('|')[2]
-    except IndexError: continue
+print("Parsing VCF...")
+for variant in vcf:
+    # Пропускаем, если нет аннотации
+    ann_info = variant.INFO.get('ANN')
+    if not ann_info:
+        continue
+    
+    # Берем первую аннотацию (обычно канонический транскрипт)
+    # Формат SnpEff: Allele|Annotation|Impact|GeneName...
+    ann_parts = ann_info.split(',')[0].split('|')
+    if len(ann_parts) < 3:
+        continue
+        
+    impact = ann_parts[2]
     
     category = None
     if impact == 'LOW': category = 'syn'
     elif impact == 'MODERATE': category = 'mis'
     elif impact == 'HIGH': category = 'lof'
-    if category is None: continue
+    
+    if category is None:
+        continue
 
-    for sample in record.samples:
-        if not sample.called: continue
-        if sample.gt_type == 1: load_counts[sample.sample][f'{category}_het'] += 1
-        elif sample.gt_type == 2: load_counts[sample.sample][f'{category}_hom'] += 1
+    # Итерация по генотипам (намного быстрее в cyvcf2)
+    # variant.gt_types: 0=HOM_REF, 1=HET, 2=HOM_ALT, 3=UNKNOWN
+    for i, gt in enumerate(variant.gt_types):
+        if gt == 1 or gt == 2: # Если есть альтернативный аллель (HET или HOM)
+            # В данном простом анализе считаем "нагрузкой" наличие аллеля
+            # Можно усложнить: HOM = 2, HET = 1
+            load_counts[samples[i]][category] += 1
 
-if count == 0:
-    print("No variants found in annotated VCF.")
-    plt.figure()
-    plt.text(0.5, 0.5, "No Data found")
-    plt.savefig(OUT_PLOT)
-    sys.exit(0)
-
+# Создание DataFrame
 df = pd.DataFrame.from_dict(load_counts, orient='index')
-df.index.name = 'IID'; df.reset_index(inplace=True)
-df['syn_total'] = df['syn_hom'] + df['syn_het']
-df['mis_total'] = df['mis_hom'] + df['mis_het']
-df['lof_total'] = df['lof_hom'] + df['lof_het']
+df.index.name = 'IID'
+df.reset_index(inplace=True)
 
-# Защита от деления на ноль
-df['Ratio_LoF_Syn'] = df.apply(lambda row: row['lof_total'] / row['syn_total'] if row['syn_total'] > 0 else 0, axis=1)
-df['Ratio_Mis_Syn'] = df.apply(lambda row: row['mis_total'] / row['syn_total'] if row['syn_total'] > 0 else 0, axis=1)
+# Расчет отношений
+# Добавляем малый эпсилон, чтобы не делить на ноль
+df['Ratio_LoF_Syn'] = df['lof'] / (df['syn'] + 1e-9)
+df['Ratio_Mis_Syn'] = df['mis'] / (df['syn'] + 1e-9)
 
 plot_df = df[['Ratio_LoF_Syn', 'Ratio_Mis_Syn']].melt(var_name='Type', value_name='Ratio')
 
 plt.figure(figsize=(10, 8))
 if not plot_df.empty:
-    # Исправление для Seaborn: hue=Type и legend=False
     sns.boxplot(x='Type', y='Ratio', hue='Type', data=plot_df, palette="Pastel1", legend=False)
     sns.stripplot(x='Type', y='Ratio', data=plot_df, color='black', alpha=0.6, jitter=True)
+    plt.title("Mutational Load Ratios (Relative to Synonymous)")
+else:
+    plt.text(0.5, 0.5, "No variants found")
 
 plt.savefig(OUT_PLOT)

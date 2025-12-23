@@ -1,0 +1,23 @@
+
+initialize() {
+    initializeMutationRate(1e-7 * 100); 
+    initializeMutationType("m1", 0.5, "f", 0.0); // Neutral
+    initializeMutationType("m2", 0.05, "g", -0.05, 0.2); // Deleterious
+    initializeGenomicElementType("g1", c(m1, m2), c(1.0, 2.0));
+    for (i in 0:49) { initializeGenomicElement(g1, i*2000, i*2000 + 999); }
+    initializeRecombinationRate(1e-8 * 100);
+}
+1 early() { sim.addSubpop("p1", 5698); }
+
+1:6981 late() {
+    if (community.tick % 50 == 0) {
+        if (p1.individualCount > 0) {
+            inds = p1.individuals;
+            load = mean(inds.countOfMutationsOfType(m2));
+            cat(community.tick + "," + load + "\n");
+        }
+    }
+}
+
+2000 early() { p1.setSubpopulationSize(48641); }
+4031 early() { p1.setSubpopulationSize(9197); }
