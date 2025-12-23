@@ -166,18 +166,31 @@ rule build_snpeff_db:
     output: directory("results/snpeff_data/calidris")
     shell:
         """
+        # 1. Очищаем старое и создаем структуру заново
+        rm -rf results/snpeff_data/calidris
         mkdir -p results/snpeff_data/calidris
+        
+        # 2. Копируем файлы с именами, которые SnpEff понимает по умолчанию
         cp {input.g} results/snpeff_data/calidris/sequences.fa
         cp {input.a} results/snpeff_data/calidris/genes.gff
         
-        # --- ИСПРАВЛЕНИЕ ---
-        # 1. Указываем SnpEff, что папка с данными - это results/snpeff_data
-        echo "data.dir = results/snpeff_data/" > snpEff_local.config
-        # 2. Добавляем название генома
-        echo "calidris.genome : Calidris" >> snpEff_local.config
+        # 3. Создаем конфиг. ВАЖНО: используем $(pwd) для абсолютного пути
+        CUR_DIR=$(pwd)
+        echo "data.dir = $CUR_DIR/results/snpeff_data/" > snpEff_local.config
+        echo "calidris.genome : calidris" >> snpEff_local.config
         
-        # Строим базу
+        # 4. Строим базу
         snpEff build -c snpEff_local.config -gff3 -v calidris -noCheckCds -noCheckProtein
+        """
+
+rule annotate_load:
+    input: vcf="results/load/polarized.vcf.gz", db="results/snpeff_data/calidris"
+    output: "results/load/annotated.vcf.gz"
+    shell:
+        """
+        # Используем созданный ранее конфиг
+        snpEff ann -c snpEff_local.config -v calidris {input.vcf} | \
+        bgzip > {output} && bcftools index -t {output}
         """
 
 # --- ПОЛЯРИЗАЦИЯ  ---
@@ -191,15 +204,17 @@ rule map_outgroup:
     threads: 1
     shell:
         """
-        # 1. Выравнивание в несжатый BAM (minimap2 съест ~7ГБ и закроется)
-        minimap2 -K 20M -t {threads} -ax asm5 {input.ref} {input.out_gen} | \
-        samtools view -b - > results/load/unsorted.bam
+        # Удаляем остатки старых попыток перед запуском
+        rm -f results/load/outgroup_mapped.bam.tmp.*.bam
         
-        # 2. Сортировка (теперь памяти будет много, выделяем 4ГБ)
-        samtools sort -m 4G -@ {threads} -o {output.bam} results/load/unsorted.bam
+        # Флаг -T позволяет samtools создавать временные файлы с уникальным префиксом
+        minimap2 -I 400M -K 10M -t {threads} -ax asm5 \
+                 --split-prefix results/load/tmp_idx \
+                 {input.ref} {input.out_gen} | \
+        samtools sort -T results/load/sort_work -m 1G -@ {threads} -o {output.bam} -
         
-        # 3. Удаление временного файла
-        rm results/load/unsorted.bam
+        # Чистим за собой
+        rm -f results/load/tmp_idx* results/load/sort_work.*.bam
         """
 
 rule call_outgroup_vcf:
@@ -229,12 +244,6 @@ rule polarize_vcf:
         bcftools index -t {output.vcf}
         """
 
-rule annotate_load:
-    input: 
-        vcf="results/load/polarized.vcf.gz", # Возвращаем polarized
-        db="results/snpeff_data/calidris"
-    output: "results/load/annotated.vcf.gz"
-    shell: "snpEff ann -c snpEff_local.config -v calidris {input.vcf} | bgzip > {output} && bcftools index -t {output}"
 
 rule calculate_rxy:
     input: "results/load/annotated.vcf.gz"

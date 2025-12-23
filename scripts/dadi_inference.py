@@ -1,3 +1,6 @@
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import sys
 import dadi
 import matplotlib.pyplot as plt
@@ -57,9 +60,10 @@ if best_model is None:
     best_model = func_ex(p0, fs.sample_sizes, pts_l)
 
 # РИСОВАНИЕ
-fig = plt.figure(figsize=(10, 8))
+fig = plt.figure(212, figsize=(8, 6))
 dadi.Plotting.plot_1d_comp_multinom(best_model, fs)
-plt.savefig(out_plot, dpi=150)
+plt.tight_layout()
+plt.savefig(out_plot)
 
 # Расчет (Theta based on unmasked sites)
 theta = dadi.Inference.optimal_sfs_scaling(best_model, fs)
