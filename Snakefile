@@ -162,35 +162,36 @@ rule dadi_inference:
 
 # --- 5. Мутационный груз (SnpEff + Rxy) ---
 rule build_snpeff_db:
-    input: g=config["resources"]["genome"], a=config["resources"]["genes"]
-    output: directory("results/snpeff_data/calidris")
+    input: 
+        g=config["resources"]["genome"], 
+        a="resources/Calidris_fixed.gff"
+    output: "results/snpeff_data/calidris/snpEffectPredictor.bin"
     shell:
         """
-        # 1. Очищаем старое и создаем структуру заново
-        rm -rf results/snpeff_data/calidris
         mkdir -p results/snpeff_data/calidris
-        
-        # 2. Копируем файлы с именами, которые SnpEff понимает по умолчанию
         cp {input.g} results/snpeff_data/calidris/sequences.fa
         cp {input.a} results/snpeff_data/calidris/genes.gff
         
-        # 3. Создаем конфиг. ВАЖНО: используем $(pwd) для абсолютного пути
-        CUR_DIR=$(pwd)
-        echo "data.dir = $CUR_DIR/results/snpeff_data/" > snpEff_local.config
+        echo "data.dir = results/snpeff_data" > snpEff_local.config
         echo "calidris.genome : calidris" >> snpEff_local.config
         
-        # 4. Строим базу
+        # ДОБАВЛЯЕМ ФЛАГИ ОБРАТНО: теперь сборка пройдет до конца без ошибок
         snpEff build -c snpEff_local.config -gff3 -v calidris -noCheckCds -noCheckProtein
         """
 
 rule annotate_load:
-    input: vcf="results/load/polarized.vcf.gz", db="results/snpeff_data/calidris"
-    output: "results/load/annotated.vcf.gz"
+    # ИЗМЕНЕНО: вместо polarized берем clean_strict
+    input: 
+        vcf="results/qc/clean_strict.vcf.gz", 
+        db="results/snpeff_data/calidris/snpEffectPredictor.bin"
+    output: 
+        vcf="results/load/annotated.vcf.gz",
+        tbi="results/load/annotated.vcf.gz.tbi"
     shell:
         """
-        # Используем созданный ранее конфиг
+        # Используем рабочую базу и наш конфиг
         snpEff ann -c snpEff_local.config -v calidris {input.vcf} | \
-        bgzip > {output} && bcftools index -t {output}
+        bgzip > {output.vcf} && bcftools index -t {output.vcf}
         """
 
 # --- ПОЛЯРИЗАЦИЯ  ---
