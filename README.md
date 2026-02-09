@@ -77,3 +77,9 @@ Spatial heterogeneity of genetic diversity across the genome.
 - **Visualization libraries**: Matplotlib, Seaborn, LEA (R)
 
 ## Project Directory Structure
+├── Snakefile                 # Main workflow definition
+├── config/
+│   └── config.yaml           # Filtering thresholds, file paths, reference locations
+├── scripts/                  # Custom Python and R scripts for statistics and plotting
+├── resources/                # Input data: multi-sample VCF, reference FASTA, GFF
+└── results/                  # (auto-generated) output figures, tables, logs
